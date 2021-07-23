@@ -13439,7 +13439,7 @@ show_param:
           {
             Lex->sql_command = SQLCOM_SHOW_BINLOGS;
           }
-        | RAFT_SYM LOGS_SYM
+        | RAFT_SYM LOGS_SYM gtid_bool
           {
             Lex->sql_command = SQLCOM_SHOW_RAFT_LOGS;
           }
@@ -14032,7 +14032,7 @@ purge_option:
 /* kill threads */
 
 kill:
-          KILL_SYM ignore_option kill_option expr
+          KILL_SYM ignore_option kill_option expr opt_reason
           {
             LEX *lex=Lex;
             lex->value_list.empty();
@@ -14051,7 +14051,9 @@ kill_option:
         | CONNECTION_SYM { Lex->type= 0; }
         | QUERY_SYM      { Lex->type= ONLY_KILL_QUERY; }
         ;
-
+opt_reason:
+          /* empty */ { Lex->kill_reason = null_lex_str; }
+        | TEXT_STRING { Lex->kill_reason = $1; }
 /* change database */
 
 use:

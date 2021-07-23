@@ -325,7 +325,10 @@ int Trans_delegate::before_commit(THD *thd, bool all)
   if (is_real_trans)
     param.flags = true;
 
-  thd->get_trans_fixed_pos(&param.log_file, &param.log_pos);
+  if (mysql_bin_log.is_apply_log)
+    thd->get_trans_relay_log_pos(&param.log_file, &param.log_pos);
+  else
+    thd->get_trans_fixed_pos(&param.log_file, &param.log_pos);
 
   DBUG_PRINT("enter", ("log_file: %s, log_pos: %llu",
                        param.log_file, param.log_pos));
@@ -363,7 +366,10 @@ int Trans_delegate::after_rollback(THD *thd, bool all)
 
   if (is_real_trans)
     param.flags|= TRANS_IS_REAL_TRANS;
-  thd->get_trans_fixed_pos(&param.log_file, &param.log_pos);
+  if (mysql_bin_log.is_apply_log)
+    thd->get_trans_relay_log_pos(&param.log_file, &param.log_pos);
+  else
+    thd->get_trans_fixed_pos(&param.log_file, &param.log_pos);
   int ret= 0;
   FOREACH_OBSERVER(ret, after_rollback, thd, (&param));
   return ret;
@@ -649,22 +655,15 @@ int Raft_replication_delegate::before_commit(THD *thd, bool all)
 }
 
 int Raft_replication_delegate::setup_flush(
-    THD *thd, bool is_relay_log,
-    IO_CACHE* log_file_cache,
-    const char *log_prefix,
-    const char *log_name,
-    mysql_mutex_t *lock_log, mysql_mutex_t *lock_index,
-    mysql_cond_t *update_cond, ulong *cur_log_ext, int context)
+    THD *thd,
+    Raft_replication_observer::st_setup_flush_arg *arg)
 {
   DBUG_ENTER("Raft_replication_delegate::setup_flush");
   Raft_replication_param param;
 
   int ret= 0;
 
-  FOREACH_OBSERVER_STRICT(ret, setup_flush, thd,
-      (is_relay_log, log_file_cache, log_prefix, log_name,
-       lock_log, lock_index, update_cond, cur_log_ext, context)
-  );
+  FOREACH_OBSERVER_STRICT(ret, setup_flush, thd, (arg));
 
   DBUG_RETURN(ret);
 }
@@ -705,6 +704,13 @@ int Raft_replication_delegate::after_commit(THD *thd, bool all)
   Raft_replication_param param;
 
   thd->get_trans_marker(&param.term, &param.index);
+
+  const char* file = nullptr;
+  unsigned long long pos = 0;
+  if (mysql_bin_log.is_apply_log)
+    thd->get_trans_relay_log_pos(&file, &pos);
+  else
+    thd->get_trans_fixed_pos(&file, &pos);
 
   int ret= 0;
   FOREACH_OBSERVER_STRICT(ret, after_commit, thd, (&param));
@@ -964,6 +970,7 @@ pthread_handler_t process_raft_queue(void *arg)
         raft_rotate_info.noop= flags & RaftListenerQueue::RAFT_FLAGS_NOOP;
         raft_rotate_info.post_append= flags &
                                       RaftListenerQueue::RAFT_FLAGS_POSTAPPEND;
+        raft_rotate_info.rotate_opid= element.arg.val_opid;
         result.error= rotate_relay_log_for_raft(&raft_rotate_info);
 #endif
         break;
@@ -1064,6 +1071,11 @@ pthread_handler_t process_raft_queue(void *arg)
                                          std::move(element.arg.val_str));
         break;
       }
+      case RaftListenerCallbackType::HANDLE_DUMP_THREADS:
+      {
+        result.error= handle_dump_threads(element.arg.val_bool);
+        break;
+      }
       default:
         break;
     }
@@ -1161,7 +1173,9 @@ void RaftListenerQueue::deinit()
   std::unique_lock<std::mutex> lock(init_mutex_);
   if (!inited_)
     return;
-  sql_print_information("Shutting down Raft listener queue");
+
+  fprintf(stderr, "Shutting down Raft listener queue");
+
   // Queue an exit event in the queue. The listener thread will eventually pick
   // this up and exit
   std::promise<RaftListenerCallbackResult> prms;

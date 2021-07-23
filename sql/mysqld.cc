@@ -503,6 +503,7 @@ bool maintain_database_hlc= 0;
 ulong wait_for_hlc_timeout_ms = 0;
 ulong wait_for_hlc_sleep_threshold_ms = 0;
 double wait_for_hlc_sleep_scaling_factor = 0.75;
+ulonglong hlc_upper_bound_delta = 0;
 my_bool async_query_counter_enabled = 0;
 ulong opt_commit_consensus_error_action= 0;
 my_bool enable_acl_fast_lookup= 0;
@@ -512,6 +513,7 @@ ulonglong max_tmp_disk_usage;
 ulonglong tmp_table_disk_usage_period_peak = 0;
 ulonglong filesort_disk_usage_period_peak = 0;
 bool enable_raft_plugin= 0;
+bool recover_raft_log= 0;
 bool disable_raft_log_repointing= 0;
 bool override_enable_raft_check= false;
 ulong opt_raft_signal_async_dump_threads= 0;
@@ -581,6 +583,7 @@ ulonglong opt_slave_dump_thread_wait_sleep_usec;
 my_bool rpl_wait_for_semi_sync_ack;
 std::atomic<ulonglong> slave_lag_sla_misses{0};
 ulonglong opt_slave_lag_sla_seconds;
+std::atomic<ulonglong> slave_commit_order_deadlocks{0};
 my_bool opt_safe_user_create = 0;
 my_bool opt_show_slave_auth_info;
 my_bool opt_log_slave_updates= 0;
@@ -655,6 +658,10 @@ ulonglong repl_semi_sync_master_ack_waits= 0;
 /* status variables for binlog fsync histogram */
 SHOW_VAR latency_histogram_binlog_fsync[NUMBER_OF_HISTOGRAM_BINS + 1];
 ulonglong histogram_binlog_fsync_values[NUMBER_OF_HISTOGRAM_BINS];
+
+/* status variables for raft trx wait times */
+SHOW_VAR latency_histogram_raft_trx_wait[NUMBER_OF_HISTOGRAM_BINS + 1];
+ulonglong histogram_raft_trx_wait_values[NUMBER_OF_HISTOGRAM_BINS];
 
 SHOW_VAR
   histogram_binlog_group_commit_var[NUMBER_OF_COUNTER_HISTOGRAM_BINS + 1];
@@ -745,8 +752,14 @@ uint write_throttle_monitor_cycles;
 uint write_throttle_lag_pct_min_secondaries;
 /* The frequency (seconds) at which auto throttling checks are run on a primary */
 ulong write_auto_throttle_frequency;
+/* Determines the step by which throttle rate probability is incremented or decremented */
+uint write_throttle_rate_step;
 /* Stores the (latest)value for sys_var write_throttle_patterns  */
 char *latest_write_throttling_rule;
+/* Stores the (latest)value for sys_var write_throttle_permissible_dimensions_in_order*/
+char *latest_write_throttle_permissible_dimensions_in_order = nullptr;
+/* Vector of all dimensions that are permissible to be throttled in order by replication lag system*/
+std::vector<enum_wtr_dimension> write_throttle_permissible_dimensions_in_order;
 /* Patterns to throttle queries in case of replication lag */
 GLOBAL_WRITE_THROTTLING_RULES_MAP global_write_throttling_rules;
 /* Controls the width of the histogram bucket (unit: kilo-bytes) */
@@ -761,6 +774,11 @@ std::list<std::pair<std::string, enum_wtr_dimension>> currently_throttled_entiti
 WRITE_MONITORED_ENTITY currently_monitored_entity;
 /* Controls whether special privileges are needed for accessing some MT tables */
 my_bool mt_tables_access_control;
+/* Vector of the client attribute names */
+std::vector<std::string> client_attribute_names;
+/* Stores the latest value for sys_var client_attribute_names */
+char *latest_client_attribute_names = nullptr;
+
 
 ulong gtid_mode;
 ulong slave_gtid_info;
@@ -808,6 +826,7 @@ char *opt_rbr_column_type_mismatch_whitelist= nullptr;
 ulonglong admission_control_filter;
 ulonglong admission_control_wait_events;
 ulonglong admission_control_yield_freq;
+my_bool admission_control_multiquery_filter;
 ulong opt_mts_slave_parallel_workers;
 ulong opt_mts_dependency_replication;
 ulonglong opt_mts_dependency_size;
@@ -1225,6 +1244,8 @@ char *opt_relay_logname = 0, *opt_relaylog_index_name=0;
 char *opt_logname, *opt_slow_logname, *opt_bin_logname;
 char *opt_apply_logname = 0;
 char *opt_applylog_index_name = 0;
+bool should_free_opt_apply_logname= false;
+bool should_free_opt_applylog_index_name= false;
 char *opt_gap_lock_logname;
 /* Static variables */
 
@@ -2544,6 +2565,7 @@ void clean_up(bool print_message)
   memcached_shutdown();
 
   free_latency_histogram_sysvars(latency_histogram_binlog_fsync);
+  free_latency_histogram_sysvars(latency_histogram_raft_trx_wait);
   free_counter_histogram_sysvars(histogram_binlog_group_commit_var);
 
   /*
@@ -2603,16 +2625,18 @@ void clean_up(bool print_message)
   free_tmpdir(&mysql_tmpdir_list);
   my_free(opt_bin_logname);
 
-  if (opt_apply_logname)
+  if (should_free_opt_apply_logname && opt_apply_logname)
   {
     my_free(opt_apply_logname);
-    opt_apply_logname = nullptr;
+    opt_apply_logname= nullptr;
+    should_free_opt_apply_logname= false;
   }
 
-  if (opt_applylog_index_name)
+  if (should_free_opt_applylog_index_name && opt_applylog_index_name)
   {
     my_free(opt_applylog_index_name);
-    opt_applylog_index_name = nullptr;
+    opt_applylog_index_name= nullptr;
+    should_free_opt_applylog_index_name= false;
   }
 
   bitmap_free(&temp_pool);
@@ -6443,8 +6467,8 @@ a file name for --log-bin-index option", opt_binlog_index_name);
     }
     else
     {
-      relay_log_basename= log_bin_basename;
-      relay_log_index= log_bin_index;
+      relay_log_basename= my_strdup(log_bin_basename, MYF(0));
+      relay_log_index= my_strdup(log_bin_index, MYF(0));
     }
 
     if (relay_log_basename == NULL || relay_log_index == NULL)
@@ -7883,6 +7907,7 @@ int mysqld_main(int argc, char **argv)
   db_ac->update_max_running_queries(opt_max_running_queries);
   db_ac->update_max_waiting_queries(opt_max_waiting_queries);
   db_ac->update_queue_weights(admission_control_weights);
+  db_ac->update_max_connections(opt_max_db_connections);
   if (init_server_components())
     unireg_abort(1);
 
@@ -8066,6 +8091,22 @@ int mysqld_main(int argc, char **argv)
 
   create_shutdown_thread();
   start_handle_manager();
+
+  // initialize write throttling dimensions at server start
+  if (latest_write_throttle_permissible_dimensions_in_order != nullptr) {
+    bool result = store_write_throttle_permissible_dimensions_in_order(
+      latest_write_throttle_permissible_dimensions_in_order);
+    if (result) {
+      sql_print_error("Could not initialize write_throttle_permissible_dimensions_in_order"
+                      " from command line params.");
+      unireg_abort(1);
+    }
+  }
+
+  // initialize client attribute names
+  if (latest_client_attribute_names != nullptr) {
+    store_client_attribute_names(latest_client_attribute_names);
+  }
 
   // NO_LINT_DEBUG
   sql_print_information(ER_DEFAULT(ER_GIT_HASH), "MySQL", git_hash, git_date);
@@ -10148,6 +10189,15 @@ static int show_jemalloc_metadata(THD *thd, SHOW_VAR *var, char *buff)
   return show_jemalloc_sizet(thd, var, buff, "stats.metadata");
 }
 
+#define JEMALLOC_STRINGIFY_HELPER(x) #x
+#define JEMALLOC_STRINGIFY(x) JEMALLOC_STRINGIFY_HELPER(x)
+static int show_jemalloc_tcache_bytes(THD *thd, SHOW_VAR *var, char *buff)
+{
+  update_malloc_status();
+  return show_jemalloc_sizet(thd, var, buff, "stats.arenas." \
+           JEMALLOC_STRINGIFY(MALLCTL_ARENAS_ALL) ".tcache_bytes");
+}
+
 bool enable_jemalloc_hppfunc(char *enable_profiling_ptr)
 {
   std::string epp(enable_profiling_ptr);
@@ -10378,6 +10428,19 @@ static int show_slave_dependency_next_waits(THD *thd, SHOW_VAR *var, char *buff)
   return 0;
 }
 
+static int show_slave_dependency_num_syncs(THD *thd, SHOW_VAR *var, char *buff)
+{
+  if (active_mi && active_mi->rli && active_mi->rli->mts_dependency_replication)
+  {
+    var->type= SHOW_LONGLONG;
+    var->value= buff;
+    *((ulonglong *)buff)= (ulonglong) active_mi->rli->num_syncs.load();
+  }
+  else
+    var->type= SHOW_UNDEF;
+  return 0;
+}
+
 static int show_slave_before_image_inconsistencies(THD *thd, SHOW_VAR *var,
                                                    char *buff)
 {
@@ -10403,6 +10466,19 @@ static int show_slave_retried_trans(THD *thd, SHOW_VAR *var, char *buff)
     var->type= SHOW_LONG;
     var->value= buff;
     *((long *)buff)= (long)active_mi->rli->retried_trans;
+  }
+  else
+    var->type= SHOW_UNDEF;
+  return 0;
+}
+
+static int show_slave_commit_order_deadlocks(THD *thd, SHOW_VAR *var, char *buf)
+{
+  if (active_mi && active_mi->rli)
+  {
+    var->type= SHOW_LONGLONG;
+    var->value= buf;
+    *((longlong *)buf)= slave_commit_order_deadlocks.load();
   }
   else
     var->type= SHOW_UNDEF;
@@ -10545,6 +10621,23 @@ static int show_latency_histogram_binlog_fsync(THD *thd, SHOW_VAR *var,
                                  histogram_binlog_fsync_values);
   var->type= SHOW_ARRAY;
   var->value = (char*) &latency_histogram_binlog_fsync;
+  return 0;
+}
+
+static int show_latency_histogram_raft_trx_wait(THD *thd, SHOW_VAR *var,
+                                                char *buff)
+{
+  size_t i;
+  for (i = 0; i < NUMBER_OF_HISTOGRAM_BINS; ++i)
+    histogram_raft_trx_wait_values[i] =
+      latency_histogram_get_count(&histogram_raft_trx_wait, i);
+
+  prepare_latency_histogram_vars(&histogram_raft_trx_wait,
+                                 latency_histogram_raft_trx_wait,
+                                 histogram_raft_trx_wait_values);
+  var->type= SHOW_ARRAY;
+  var->value = (char*) &latency_histogram_raft_trx_wait;
+
   return 0;
 }
 
@@ -11129,6 +11222,7 @@ SHOW_VAR status_vars[]= {
   {"Jemalloc_stats_allocated", (char*) &show_jemalloc_allocated,        SHOW_FUNC},
   {"Jemalloc_stats_mapped",    (char*) &show_jemalloc_mapped,           SHOW_FUNC},
   {"Jemalloc_stats_metadata",  (char*) &show_jemalloc_metadata,         SHOW_FUNC},
+  {"Jemalloc_tcache_bytes",    (char*) &show_jemalloc_tcache_bytes,     SHOW_FUNC},
 #endif
 #endif
   {"Json_contains_count",      (char*) &json_contains_count,            SHOW_LONGLONG},
@@ -11266,6 +11360,7 @@ SHOW_VAR status_vars[]= {
   {"Slave_open_temp_tables",   (char*) &slave_open_temp_tables, SHOW_INT},
 #ifdef HAVE_REPLICATION
   {"Slave_retried_transactions",(char*) &show_slave_retried_trans, SHOW_FUNC},
+  {"Slave_Commit_order_deadlocks",(char*) &show_slave_commit_order_deadlocks, SHOW_FUNC},
   {"Slave_heartbeat_period",   (char*) &show_heartbeat_period, SHOW_FUNC},
   {"Slave_received_heartbeats",(char*) &show_slave_received_heartbeats, SHOW_FUNC},
   {"Slave_lag_sla_misses",     (char*) &show_slave_lag_sla_misses, SHOW_FUNC},
@@ -11278,6 +11373,7 @@ SHOW_VAR status_vars[]= {
   {"Slave_dependency_in_flight", (char*) &show_slave_dependency_in_flight, SHOW_FUNC},
   {"Slave_dependency_begin_waits", (char*) &show_slave_dependency_begin_waits, SHOW_FUNC},
   {"Slave_dependency_next_waits", (char*) &show_slave_dependency_next_waits, SHOW_FUNC},
+  {"Slave_dependency_num_syncs", (char*) &show_slave_dependency_num_syncs, SHOW_FUNC},
   {"Slave_before_image_inconsistencies", (char*) &show_slave_before_image_inconsistencies, SHOW_FUNC},
 	{"Slave_high_priority_ddl_executed", (char *)&slave_high_priority_ddl_executed, SHOW_LONGLONG},
 	{"Slave_high_priority_ddl_killed_connections", (char *)&slave_high_priority_ddl_killed_connections, SHOW_LONGLONG},
@@ -11355,6 +11451,8 @@ SHOW_VAR status_vars[]= {
   {"Write_queries",            (char*) &write_queries,          SHOW_LONG},
   {"Write_queries_rejected",   (char*) &write_query_rejected,   SHOW_LONG},
   {"Write_queries_running",    (char*) &write_query_running,    SHOW_INT},
+  {"Rpl_raft_trx_wait_histogram",
+   (char*) &show_latency_histogram_raft_trx_wait, SHOW_FUNC},
   {NullS, NullS, SHOW_LONG}
 };
 
@@ -12256,12 +12354,14 @@ a file name for --apply-log-index option", opt_applylog_index_name);
     {
       tstr.replace(fpos, rep_from1.length(), rep_to1);
       opt_apply_logname= my_strdup(tstr.c_str(), MYF(0));
+      should_free_opt_apply_logname= true;
     }
     else if ((fpos = tstr.find(rep_from2)) != std::string::npos)
     {
       std::string rep_to2("-apply");
       tstr.replace(fpos, rep_from2.length(), rep_to2);
       opt_apply_logname= my_strdup(tstr.c_str(), MYF(0));
+      should_free_opt_apply_logname= true;
     }
     else if (enable_raft_plugin)
     {
@@ -12273,12 +12373,14 @@ a file name for --apply-log-index option", opt_applylog_index_name);
   {
     // Just point apply logs to binlogs
     opt_apply_logname= my_strdup(opt_bin_logname, MYF(0));
+    should_free_opt_apply_logname= true;
   }
 
   if (!opt_applylog_index_name && opt_apply_logname)
   {
     opt_applylog_index_name=
       const_cast<char *>(rpl_make_log_name(NULL, opt_apply_logname, ".index"));
+    should_free_opt_applylog_index_name= true;
   }
 
   DBUG_RETURN(0);

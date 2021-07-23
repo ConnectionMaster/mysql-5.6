@@ -2761,6 +2761,12 @@ static Sys_var_mybool Sys_optimizer_full_scan(
       SESSION_VAR(optimizer_full_scan),
       CMD_LINE(OPT_ARG), DEFAULT(TRUE));
 
+static Sys_var_double Sys_optimizer_group_by_cost_adjust(
+    "optimizer_group_by_cost_adjust",
+    "Adjust cost of loose index scan group-by plan by this factor.",
+    SESSION_VAR(optimizer_group_by_cost_adjust), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, DBL_MAX), DEFAULT(1));
+
 static const char *optimizer_switch_names[]=
 {
   "index_merge", "index_merge_union", "index_merge_sort_union",
@@ -2772,7 +2778,7 @@ static const char *optimizer_switch_names[]=
   "subquery_materialization_cost_based",
 #endif
   "use_index_extensions", "skip_scan", "skip_scan_cost_based",
-  "multi_range_groupby",
+  "multi_range_groupby", "group_by_limit",
   "default", NullS
 };
 /** propagates changes to @@engine_condition_pushdown */
@@ -3622,7 +3628,7 @@ static Sys_var_charptr Sys_admission_control_weights(
        ON_CHECK(check_admission_control_weights));
 
 const char *admission_control_wait_events_names[]=
-       {"SLEEP", "ROW_LOCK", "USER_LOCK", "NET_IO", "YIELD", 0};
+       {"SLEEP", "ROW_LOCK", "USER_LOCK", "NET_IO", "YIELD", "META_DATA_LOCK", "COMMIT", 0};
 static Sys_var_set Sys_admission_control_wait_events(
        "admission_control_wait_events",
        "Determines events for which queries will exit admission control. After the wait event completes, the query will have to re-enter admission control.",
@@ -3637,6 +3643,11 @@ static Sys_var_ulonglong Sys_admission_control_yield_freq(
        GLOBAL_VAR(admission_control_yield_freq),
        CMD_LINE(OPT_ARG), VALID_RANGE(1, ULONGLONG_MAX), DEFAULT(1000),
        BLOCK_SIZE(1));
+
+static Sys_var_mybool Sys_admission_control_multiquery_filter(
+       "admission_control_multiquery_filter",
+       "Run filter on subsequent queries in multi-query statement",
+       GLOBAL_VAR(admission_control_multiquery_filter), CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
 static Sys_var_mybool Sys_slave_sql_verify_checksum(
        "slave_sql_verify_checksum",
@@ -5470,9 +5481,16 @@ static Sys_var_uint Sys_checkpoint_mts_group(
 #endif /* DBUG_OFF */
 #endif /* HAVE_REPLICATION */
 
-static bool log_enable_raft_change(sys_var *self, THD *thd, enum_var_type type)
+static bool update_enable_raft_change(
+    sys_var *self, THD *thd, enum_var_type type)
 {
   const char *user = "unknown";  const char *host = "unknown";
+
+#ifdef HAVE_REPLICATION
+  // NO_LINT_DEBUG
+  sql_print_information("Unblocking binlog dump threads");
+  unblock_all_dump_threads();
+#endif
 
   if (thd)
   {
@@ -6032,6 +6050,16 @@ static Sys_var_gtid_purged Sys_gtid_purged(
        NOT_IN_BINLOG, ON_CHECK(check_gtid_purged));
 export sys_var *Sys_gtid_purged_ptr= &Sys_gtid_purged;
 
+Gtid_set *gtid_purged_for_tailing;
+static Sys_var_gtid_purged_for_tailing Sys_gtid_purged_for_tailing(
+       "gtid_purged_for_tailing",
+       "The set of GTIDs that existed in previous, purged binary logs in "
+       "non-raft mode. The set of GTIDs that existed in previous, purged "
+       "raft logs in raft mode; ",
+       READ_ONLY GLOBAL_VAR(gtid_purged), NO_CMD_LINE,
+       DEFAULT(NULL), NO_MUTEX_GUARD,
+       NOT_IN_BINLOG);
+
 static Sys_var_gtid_owned Sys_gtid_owned(
        "gtid_owned",
        "The global variable lists all GTIDs owned by all threads. "
@@ -6504,12 +6532,21 @@ static Sys_var_mybool Sys_improved_dup_key_error(
        GLOBAL_VAR(opt_improved_dup_key_error),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
+static bool update_session_dscp_on_socket(sys_var *self, THD *thd,
+                                                     enum_var_type type)
+{
+  return !thd->set_dscp_on_socket();
+}
+
 static Sys_var_ulong Sys_session_set_dscp_on_socket(
        "dscp_on_socket",
-       "DSCP value for socket/connection to control binlog downloads",
-       SESSION_ONLY(dscp_on_socket),
+       "DSCP value for socket/connection to control out-bound packages. "
+       "0 means unset, and it will use default value. To overrides, use number"
+       " from 1 to 63",
+       SESSION_VAR(dscp_on_socket),
        NO_CMD_LINE, VALID_RANGE(0, 63), DEFAULT(0), BLOCK_SIZE(1),
-       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(NULL), ON_UPDATE(update_session_dscp_on_socket));
 
 static Sys_var_mybool Sys_rpl_slave_flow_control(
        "rpl_slave_flow_control", "If this is set then underrun and "
@@ -6624,6 +6661,13 @@ static bool validate_enable_raft(sys_var *self, THD *thd, set_var *var)
     // as flush failures can be common during leader change.
     err= true;
   }
+
+  if (!err)
+  {
+    // NO_LINT_DEBUG
+    sql_print_information("Killing and blocking binlog dump threads");
+    err= !block_all_dump_threads();
+  }
 #endif
   return err;
 }
@@ -6723,6 +6767,12 @@ static Sys_var_mybool Sys_enable_block_stale_hlc_read(
     SESSION_VAR(enable_block_stale_hlc_read), CMD_LINE(OPT_ARG), DEFAULT(FALSE),
     NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_enable_block_stale_hlc_read));
 
+static Sys_var_mybool Sys_enable_hlc_bound(
+    "enable_hlc_bound",
+    "Enable HLC bound enforcement for transactional operations",
+    SESSION_VAR(enable_hlc_bound), CMD_LINE(OPT_ARG), DEFAULT(false),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static Sys_var_ulong Sys_wait_for_hlc_timeout_ms(
     "wait_for_hlc_timeout_ms",
     "How long to wait for the specified HLC to be applied to the engine before "
@@ -6746,6 +6796,14 @@ static Sys_var_ulong Sys_wait_for_hlc_sleep_threshold_ms(
     "rather than blocking on the per-database wait queue",
     GLOBAL_VAR(wait_for_hlc_sleep_threshold_ms), CMD_LINE(OPT_ARG),
     VALID_RANGE(0, 10000), DEFAULT(50), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_hlc_upper_bound_delta(
+    "hlc_upper_bound_delta",
+    "Min acceptable difference between current HLC value and upper HLC "
+    "boundary specified for the query",
+    GLOBAL_VAR(hlc_upper_bound_delta), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, ULONG_LONG_MAX), DEFAULT(0), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
 /*
@@ -6883,6 +6941,14 @@ static Sys_var_enum Sys_sql_stats_control(
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
        ON_UPDATE(set_sql_stats_control));
 
+static Sys_var_mybool Sys_sql_stats_read_control(
+       "sql_stats_read_control",
+       "Controls reading from SQL_STATISTICS, SQL_TEXT and "
+       "CLIENT_ATTRIBUTES tables.",
+       SESSION_VAR(sql_stats_read_control),
+       CMD_LINE(OPT_ARG),
+       DEFAULT(TRUE));
+
 static bool update_max_sql_stats_limits(sys_var *, THD *, enum_var_type type)
 {
   // This will clear out all the stats collected so far if the limits are
@@ -6915,7 +6981,7 @@ static Sys_var_uint Sys_max_sql_text_storage_size(
        "Maximum allowed memory to store each normalized SQL text (in bytes).",
        READ_ONLY GLOBAL_VAR(max_sql_text_storage_size),
        CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, SQL_TEXT_COL_SIZE),
-       DEFAULT(1024),
+       DEFAULT(SQL_TEXT_COL_SIZE),
        BLOCK_SIZE(1));
 
 static bool set_column_stats_control(sys_var *, THD *, enum_var_type type)
@@ -7123,6 +7189,8 @@ static bool update_write_throttling_patterns(sys_var *self, THD *thd,
 
   if (strcmp(latest_write_throttling_rule, "OFF") == 0) {
        free_global_write_throttling_rules();
+       currently_throttled_entities.clear();
+       currently_monitored_entity.reset();
        return false; // success
   }
   return store_write_throttling_rules(thd);
@@ -7136,6 +7204,21 @@ static Sys_var_charptr Sys_write_throttling_patterns(
       GLOBAL_VAR(latest_write_throttling_rule), CMD_LINE(OPT_ARG),
       IN_SYSTEM_CHARSET, DEFAULT("OFF"), NO_MUTEX_GUARD, NOT_IN_BINLOG,
       ON_CHECK(nullptr), ON_UPDATE(update_write_throttling_patterns));
+
+static bool check_write_throttle_permissible_dimensions_in_order(
+       sys_var *self, THD *thd, set_var *var) {
+       return store_write_throttle_permissible_dimensions_in_order(
+              var->save_result.string_value.str);
+}
+
+static Sys_var_charptr Sys_write_throttle_permissible_dimensions_in_order(
+      "write_throttle_permissible_dimensions_in_order",
+      "All the dimensions(SQL_ID, CLIENT, USER, SHARD) that are permitted to be"
+      "auto throttled in order in case of replication lag.",
+      GLOBAL_VAR(latest_write_throttle_permissible_dimensions_in_order),
+      CMD_LINE(OPT_ARG), IN_SYSTEM_CHARSET, DEFAULT("OFF"), NO_MUTEX_GUARD,
+      NOT_IN_BINLOG,
+      ON_CHECK(check_write_throttle_permissible_dimensions_in_order));
 
 static Sys_var_ulong Sys_write_start_throttle_lag_milliseconds(
       "write_start_throttle_lag_milliseconds",
@@ -7181,6 +7264,18 @@ static Sys_var_uint Sys_write_throttle_lag_pct_min_secondaries(
       NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
       ON_UPDATE(nullptr));
 
+/* Free currently_throttled_entities if sys_var is set to 0 */
+static bool update_write_auto_throttle_frequency(sys_var *self, THD *thd,
+                                               enum_var_type type) {
+  if (write_auto_throttle_frequency == 0)
+  {
+    currently_throttled_entities.clear();
+    currently_monitored_entity.reset();
+    free_global_write_auto_throttling_rules();
+  }
+  return false; // success
+}
+
 static Sys_var_ulong Sys_write_auto_throttle_frequency(
        "write_auto_throttle_frequency",
        "The frequency (seconds) at which auto throttling checks are run on a primary. "
@@ -7188,6 +7283,16 @@ static Sys_var_ulong Sys_write_auto_throttle_frequency(
        GLOBAL_VAR(write_auto_throttle_frequency),
        CMD_LINE(OPT_ARG), VALID_RANGE(0, LONG_TIMEOUT),
        DEFAULT(0), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(nullptr), ON_UPDATE(update_write_auto_throttle_frequency));
+
+static Sys_var_uint Sys_write_throttle_rate_step(
+       "write_throttle_rate_step",
+       "This variable determines the step by which throttle rate probability is incremented "
+       "or decremented. Default value is 100 which means an entity is either fully throttled "
+       "or not throttled at all",
+       GLOBAL_VAR(write_throttle_rate_step),
+       CMD_LINE(OPT_ARG), VALID_RANGE(0, 100),
+       DEFAULT(100), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(nullptr), ON_UPDATE(nullptr));
 
 static bool check_max_tmp_disk_usage(sys_var *self, THD *thd, set_var *var)
@@ -7267,6 +7372,11 @@ static Sys_var_mybool Sys_sql_stats_snapshot(
        SESSION_ONLY(sql_stats_snapshot), NO_CMD_LINE,
        DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(check_sql_stats_snapshot));
+
+static Sys_var_mybool Sys_sql_stats_auto_snapshot(
+       "sql_stats_auto_snapshot",
+       "Enable sql_statistics snapshot automatically for this session",
+       SESSION_VAR(sql_stats_auto_snapshot), NO_CMD_LINE, DEFAULT(TRUE));
 
 static const char *control_level_values[] =
 { "OFF", "NOTE", "WARN", "ERROR",
@@ -7370,7 +7480,7 @@ static Sys_var_mybool Sys_enable_raft_plugin(
        GLOBAL_VAR(enable_raft_plugin),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE),
        NO_MUTEX_GUARD, NOT_IN_BINLOG,
-       ON_CHECK(validate_enable_raft), ON_UPDATE(log_enable_raft_change));
+       ON_CHECK(validate_enable_raft), ON_UPDATE(update_enable_raft_change));
 
 static Sys_var_mybool Sys_disable_raft_log_repointing(
        "disable_raft_log_repointing", "Enable/Disable repointing for raft logs",
@@ -7432,7 +7542,7 @@ static Sys_var_mybool Sys_reset_period_status_vars(
 static Sys_var_mybool Sys_show_query_digest(
        "show_query_digest",
        "Show query digest instead of full query in show process list."
-       "Requres sql_stats_control to be on.",
+       "Requires sql_stats_control to be on.",
        SESSION_VAR(show_query_digest),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
@@ -7484,3 +7594,33 @@ static Sys_var_mybool Sys_set_read_only_on_shutdown(
        "kill connections but before shutting down plugins",
        GLOBAL_VAR(set_read_only_on_shutdown),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static Sys_var_mybool Sys_recover_raft_log(
+       "recover_raft_log",
+       "Temprary variable to control recovery of raft log by removing partial "
+       "trxs. This should be removed later.",
+       GLOBAL_VAR(recover_raft_log),
+       CMD_LINE(OPT_ARG), DEFAULT(TRUE),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_max_index_stats_entries_per_table(
+      "max_index_stats_entries_per_table",
+      "Maximum number of entries in INDEX_STATISTICS per table",
+      GLOBAL_VAR(max_index_stats_entries_per_table), CMD_LINE(OPT_ARG),
+      VALID_RANGE(0, UINT_MAX), DEFAULT(30), BLOCK_SIZE(1));
+
+static bool check_client_attribute_names(sys_var *self, THD *thd, set_var *var)
+{
+  store_client_attribute_names(var->save_result.string_value.str);
+
+  return false; // success
+}
+
+static Sys_var_charptr Sys_client_attribute_names(
+      "client_attribute_names",
+      "List of supported query/connection attributes to use for "
+      "for client_attributes (default: caller,async_id).",
+      GLOBAL_VAR(latest_client_attribute_names),
+      CMD_LINE(OPT_ARG), IN_SYSTEM_CHARSET, DEFAULT("caller,async_id"),
+      NO_MUTEX_GUARD, NOT_IN_BINLOG,
+      ON_CHECK(check_client_attribute_names));

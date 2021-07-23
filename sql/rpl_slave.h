@@ -275,7 +275,7 @@ extern uint rpl_receive_buffer_size;
 */
 #define SLAVE_FORCE_ALL 4
 
-int start_slave(THD* thd, Master_info* mi, bool net_report);
+int start_slave(THD* thd, Master_info* mi, bool net_report, bool invoked_by_raft= false);
 int stop_slave(THD* thd, Master_info* mi, bool net_report);
 bool change_master(THD* thd, Master_info* mi);
 int reset_slave(THD *thd, Master_info* mi, bool purge=true);
@@ -285,7 +285,7 @@ int rli_relay_log_raft_reset(
 int raft_reset_slave(THD *thd);
 int init_recovery(Master_info* mi, const char** errmsg);
 int global_init_info(Master_info* mi, bool ignore_if_no_info, int thread_mask,
-                     bool need_lock= true);
+                     bool need_lock= true, bool startup= false);
 void end_info(Master_info* mi);
 int remove_info(Master_info* mi);
 int flush_master_info(Master_info* mi, bool force);
@@ -364,11 +364,19 @@ extern my_bool master_ssl;
 extern char *master_ssl_ca, *master_ssl_capath, *master_ssl_cert;
 extern char *master_ssl_cipher, *master_ssl_key;
 
+struct before_image_mismatch
+{
+  std::string table;
+  std::string gtid;
+  std::string log_pos;
+  std::string source_img;
+  std::string local_img;
+};
 extern ulong before_image_inconsistencies;
-extern std::unordered_map<std::string, std::string> bi_inconsistencies;
+extern std::unordered_map<std::string, before_image_mismatch>
+  bi_inconsistencies;
 extern std::mutex bi_inconsistency_lock;
-extern void update_before_image_inconsistencies(
-    const char* db, const char* table, const char* gtid);
+extern void update_before_image_inconsistencies(const before_image_mismatch&);
 extern ulong get_num_before_image_inconsistencies();
 
 int mts_recovery_groups(Relay_log_info *rli);

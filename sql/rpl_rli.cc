@@ -453,7 +453,14 @@ bool Relay_log_info::cannot_safely_rollback()
   {
     worker= *dynamic_element(&workers, i, Slave_worker**);
     mysql_mutex_lock(&worker->jobs_lock);
-    ret= ret || worker->info_thd->transaction.all.cannot_safely_rollback();
+    // workers could have been killed and in that case
+    // the state is NOT_RUNNING. The info_thd would be
+    // destroyed soon/already and hence it would be an
+    // illegal memory read to look at info_thd
+    if (worker->running_status != Slave_worker::NOT_RUNNING)
+    {
+      ret= ret || worker->info_thd->transaction.all.cannot_safely_rollback();
+    }
     mysql_mutex_unlock(&worker->jobs_lock);
   }
   return ret;
@@ -1015,7 +1022,7 @@ int Relay_log_info::wait_for_pos(THD* thd, String* log_name,
     }
     else
       mysql_cond_wait(&data_cond, &data_lock);
-    thd_wait_end(thd);
+
     DBUG_PRINT("info",("Got signal of master update or timed out"));
     if (error == ETIMEDOUT || error == ETIME)
     {
@@ -1037,6 +1044,7 @@ int Relay_log_info::wait_for_pos(THD* thd, String* log_name,
 
 err:
   thd->EXIT_COND(&old_stage);
+  thd_wait_end(thd);
   DBUG_PRINT("exit",("killed: %d  abort: %d  slave_running: %d \
 improper_arguments: %d  timed_out: %d",
                      thd->killed_errno(),
@@ -1161,7 +1169,7 @@ int Relay_log_info::wait_for_gtid_set(THD* thd, String* gtid,
     }
     else
       mysql_cond_wait(&data_cond, &data_lock);
-    thd_wait_end(thd);
+
     DBUG_PRINT("info",("Got signal of master update or timed out"));
     if (error == ETIMEDOUT || error == ETIME)
     {
@@ -1183,6 +1191,7 @@ int Relay_log_info::wait_for_gtid_set(THD* thd, String* gtid,
 
 err:
   thd->EXIT_COND(&old_stage);
+  thd_wait_end(thd);
   DBUG_PRINT("exit",("killed: %d  abort: %d  slave_running: %d \
 improper_arguments: %d  timed_out: %d",
                      thd->killed_errno(),
@@ -1882,7 +1891,7 @@ bool mysql_show_relaylog_events(THD* thd)
 
 #endif
 
-int Relay_log_info::rli_init_info()
+int Relay_log_info::rli_init_info(bool startup)
 {
   int error= 0;
   enum_return_check check_return= ERROR_CHECKING_REPOSITORY;
@@ -1902,7 +1911,15 @@ int Relay_log_info::rli_init_info()
     not and so init_info() must be aware of previous failures.
   */
   if (error_on_rli_init_info)
+  {
+    // In raft  mode, these error codes are critical. Hence we should
+    // not chew them.
+    if (!startup && enable_raft_plugin)
+    {
+      error= 1;
+    }
     goto err;
+  }
 
   if (inited)
   {
@@ -1937,10 +1954,35 @@ int Relay_log_info::rli_init_info()
     if (!hot_log)
       mysql_mutex_unlock(log_lock);
 
-    my_b_seek(cur_log, (my_off_t) 0);
+    // In raft mode we re-init the IO_CACHE because the relay log (raft log)
+    // might be truncated later
+    if (enable_raft_plugin && hot_log)
+    {
+      File file= cur_log->file;
+      size_t len= cur_log->buffer_length;
+      enum cache_type type= cur_log->type;
+      myf flags= cur_log->myflags;
+      if (end_io_cache(cur_log) == 0 &&
+          init_io_cache(cur_log, file, len, type, 0, 0, flags) == 0)
+      {
+        sql_print_information(
+            "Reinited relay log to handle potential raft log truncation");
+      }
+      else
+      {
+        error= 1;
+        sql_print_error(
+            "Error while reiniting relay log to handle potential raft log "
+            "truncation");
+      }
+    }
+    else
+      my_b_seek(cur_log, (my_off_t) 0);
 
     if (hot_log)
       mysql_mutex_unlock(log_lock);
+    if (error)
+      DBUG_RETURN(1);
     DBUG_RETURN((gtid_mode == 0 && recovery_parallel_workers) ?
                 mts_recovery_groups(this) : 0);
   }
@@ -2055,6 +2097,19 @@ a file name for --relay-log-index option.", opt_relaylog_index_name);
                       " called from Relay_log_info::rli_init_info().");
       DBUG_RETURN(1);
     }
+
+    if (enable_raft_plugin && startup)
+    {
+      // recover relay/raft logs on mysqld startup. This is to remove partial
+      // trxs from the log
+      if (relay_log.recover_raft_log())
+      {
+        // TODO: Ignoring error for now. Will change the behavior once validated
+        // NO_LINT_DEBUG
+        sql_print_information("Failed to recover raft logs");
+      }
+    }
+
 #ifndef DBUG_OFF
     global_sid_lock->wrlock();
     gtid_set.dbug_print("set of GTIDs in relay log before initialization");

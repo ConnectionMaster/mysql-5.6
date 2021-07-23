@@ -259,12 +259,31 @@ inline bool is_temporal_type(enum_field_types type)
   }
 }
 
+/**
+  Tests if field type is an integer
+
+  @param type Field type, as returned by field->type()
+
+  @returns true if integer type, false otherwise
+*/
+inline bool is_integer_type(enum_field_types type) {
+  switch (type) {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    return true;
+  default:
+    return false;
+  }
+}
 
 /**
   Tests if field real type is temporal, i.e. represents
   all existing implementations of
   DATE, TIME, DATETIME or TIMESTAMP types in SQL.
-     
+
   @param type    Field real type, as returned by field->real_type()
   @retval true   If field real type is temporal
   @retval false  If field real type is not temporal
@@ -1438,7 +1457,7 @@ public:
 */
   virtual bool is_updatable() const { return FALSE; }
 
-  friend int cre_myisam(char * name, register TABLE *form, uint options,
+  friend int cre_myisam(char * name, TABLE *form, uint options,
 			ulonglong auto_increment_value);
   friend class Copy_field;
   friend class Item_avg_field;

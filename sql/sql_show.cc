@@ -2252,27 +2252,6 @@ static bool thd_compare (const THD* p1, const THD* p2)
   return p1->thread_id() < p2->thread_id();
 }
 
-static const char* missing_digest =
-  "<digest_missing: sql_stats_control required>";
-
-static void get_query_digest(THD *thd, THD *tmp, String *digest_string,
-                             const char **str, const CHARSET_INFO **cs) {
-  if (tmp->m_digest != NULL) {
-    compute_digest_text(&tmp->m_digest->m_digest_storage, digest_string);
-  }
-
-  if (digest_string->is_empty() ||
-      (digest_string->length() == 1 &&
-       digest_string->ptr()[0] == 0)) {
-    /* We couldn't compute digest - we need sql_stats_control */
-    *str = missing_digest;
-    *cs = &my_charset_utf8_bin;
-  } else {
-    *str = digest_string->c_ptr_safe();
-    *cs = digest_string->charset();
-  }
-}
-
 // THD mutex and sys_var mutex is acquired when this function is called.
 static void set_thread_info_query_safe(thread_info *thd_info,
                               THD* thd, THD *tmp, ulong max_query_length)
@@ -2293,9 +2272,10 @@ static void set_thread_info_query_safe(thread_info *thd_info,
   }
   if (query) {
     if (thd->variables.show_query_digest) {
-      get_query_digest(thd, tmp, &thd_info->digest_string,
-                       &thd_info->query_string,
-                       &thd_info->query_string_charset);
+      tmp->get_query_digest(&thd_info->digest_string,
+                            &thd_info->query_string, &length,
+                            &thd_info->query_string_charset);
+      length= min<uint>(max_query_length, length);
     } else {
       length= min<uint>(max_query_length, length);
       char *q= thd->strmake(query,length);
@@ -2779,10 +2759,10 @@ static bool fill_fields_processlist(THD *thd, THD *conn_thd, TABLE *table,
     String digest_string;
     const char *query_str;
     const CHARSET_INFO *query_cs;
-    size_t query_length;
+    uint32 query_length;
     if (thd->variables.show_query_digest) {
-      get_query_digest(thd, tmp, &digest_string, &query_str, &query_cs);
-      query_length = strlen(query_str);
+      tmp->get_query_digest(&digest_string, &query_str, &query_length,
+                            &query_cs);
     } else {
       query_str = tmp->query();
       query_cs = cs;
@@ -4045,12 +4025,19 @@ int fill_rbr_bi_inconsistencies(THD* thd, TABLE_LIST* tables, Item* cond)
   const std::lock_guard<std::mutex> lock(bi_inconsistency_lock);
   for (const auto& entry : bi_inconsistencies)
   {
+    const auto &info = entry.second;
     restore_record(table, s->default_values);
 
     /* Table name */
-    table->field[0]->store(entry.first.c_str(), entry.first.size(), cs);
+    table->field[0]->store(info.table.c_str(), info.table.size(), cs);
     /* Last inconsistent GTID */
-    table->field[1]->store(entry.second.c_str(), entry.second.size(), cs);
+    table->field[1]->store(info.gtid.c_str(), info.gtid.size(), cs);
+    /* Last inconsistent log pos */
+    table->field[2]->store(info.log_pos.c_str(), info.log_pos.size(), cs);
+    /* Column values from source */
+    table->field[3]->store(info.source_img.c_str(), info.source_img.size(), cs);
+    /* Column values from local DB */
+    table->field[4]->store(info.local_img.c_str(), info.local_img.size(), cs);
 
     if (schema_table_store_record(thd, table))
     {
@@ -4628,18 +4615,6 @@ bool schema_table_store_record(THD *thd, TABLE *table)
   }
   return 0;
 }
-
-
-static int make_table_list(THD *thd, SELECT_LEX *sel,
-                           LEX_STRING *db_name, LEX_STRING *table_name)
-{
-  Table_ident *table_ident;
-  table_ident= new Table_ident(thd, *db_name, *table_name, 1);
-  if (!sel->add_table_to_list(thd, table_ident, 0, 0, TL_READ, MDL_SHARED_READ))
-    return 1;
-  return 0;
-}
-
 
 /**
   @brief    Get lookup value from the part of 'WHERE' condition
@@ -10124,9 +10099,14 @@ ST_FIELD_INFO slave_db_load_fields_info[]=
 
 ST_FIELD_INFO rbr_bi_inconsistencies_fields_info[]=
 {
-  {"TABLE", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Table",
-   SKIP_OPEN_TABLE},
+  {"TABLE", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Table", SKIP_OPEN_TABLE},
   {"LAST_GTID", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Last GTID",
+   SKIP_OPEN_TABLE},
+  {"SOURCE_LOG_POS", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Source Log Pos",
+   SKIP_OPEN_TABLE},
+  {"SOURCE_IMAGE", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Source Image",
+   SKIP_OPEN_TABLE},
+  {"LOCAL_IMAGE", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Local Image",
    SKIP_OPEN_TABLE},
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE}
 };

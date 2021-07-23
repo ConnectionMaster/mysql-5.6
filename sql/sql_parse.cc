@@ -171,7 +171,8 @@ using std::min;
 static bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables,
 	ulonglong *last_timer);
 static bool check_show_access(THD *thd, TABLE_LIST *table);
-static void sql_kill(THD *thd, my_thread_id id, bool only_kill_query);
+static void sql_kill(THD *thd, my_thread_id id, bool only_kill_query,
+                     const char *reason = nullptr);
 static bool lock_tables_precheck(THD *thd, TABLE_LIST *tables);
 static void store_warnings_in_resp_attrs(THD *thd);
 
@@ -1542,6 +1543,10 @@ static inline bool is_query(enum enum_server_command command) {
 */
 static void update_sql_stats(THD *thd, SHARED_SQL_STATS *cumulative_sql_stats, char* sub_query)
 {
+  /* Release auto snapshot so that it doesn't have to be merged with
+     stats for this statement later. */
+  thd->release_auto_created_sql_stats_snapshot();
+
   if (sql_stats_control == SQL_INFO_CONTROL_ON)
   {
     SHARED_SQL_STATS sql_stats;
@@ -1582,6 +1587,8 @@ static void update_sql_stats(THD *thd, SHARED_SQL_STATS *cumulative_sql_stats, c
   thd->mt_key_clear(THD::SQL_ID);
   thd->mt_key_clear(THD::PLAN_ID);
   thd->mt_key_clear(THD::SQL_HASH);
+
+  thd->reset_all_mt_table_filled();
 }
 
 /**
@@ -4729,7 +4736,7 @@ end_with_restore_list:
       /* db ops requested that this work for non-super */
       /* if (check_global_access(thd, SUPER_ACL | REPL_CLIENT_ACL))
 	goto error; */
-      res = show_raft_logs(thd);
+      res = show_raft_logs(thd, lex->with_gtid);
       break;
     }
 #endif
@@ -5882,7 +5889,8 @@ end_with_restore_list:
       goto error;
     }
     sql_kill(thd, static_cast<my_thread_id>(it->val_int()),
-             lex->type & ONLY_KILL_QUERY);
+             lex->type & ONLY_KILL_QUERY,
+             lex->kill_reason.length > 0 ? lex->kill_reason.str : nullptr);
     break;
   }
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
@@ -6817,6 +6825,11 @@ finish:
       trans_rollback_stmt(thd);
     else
     {
+      // Mark this scope as a commit wait. It is done here instead of
+      // ordered_commit to limit the scope just to auto commit after a single
+      // statement.
+      Thd_wait_scope wait_scope(thd, THD_WAIT_COMMIT);
+
       /* If commit fails, we should be able to reset the OK status. */
       thd->get_stmt_da()->set_overwrite_status(true);
       trans_commit_stmt(thd, lex->async_commit);
@@ -6916,15 +6929,15 @@ static bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables,
         new Item_int((ulonglong) thd->variables.select_limit);
   }
 
+  if (mysql_bin_log.wait_for_hlc_applied(thd, all_tables)) {
+    return 1;
+  }
+
 #ifdef HAVE_MY_TIMER
   //check if timer is applicable to statement, if applicable then set timer.
   if (is_timer_applicable_to_statement(thd))
     statement_timer_armed= set_statement_timer(thd);
 #endif
-
-  if (mysql_bin_log.wait_for_hlc_applied(thd, all_tables)) {
-    return 1;
-  }
 
   res = open_normal_and_derived_tables(thd, all_tables, 0);
 
@@ -8216,7 +8229,7 @@ static bool mt_check_throttle_write_query(THD* thd)
       if (time_now - last_replication_lag_check_time >= (long)write_auto_throttle_frequency)
       {
         // check replication lag and throttle, if needed
-        check_lag_and_throttle();
+        check_lag_and_throttle(time_now);
         // update last check time
         last_replication_lag_check_time = time_now;
       }
@@ -8236,31 +8249,34 @@ static bool mt_check_throttle_write_query(THD* thd)
     if (iter != global_write_throttling_rules[i].end())
     {
       WRITE_THROTTLING_RULE &rule = iter->second;
-      int mt_throttle_tag_level = thd->get_mt_throttle_tag_level();
 
-      if (iter->second.mode == WTR_MANUAL ||
-          (!thd->variables.write_throttle_tag_only &&
-           write_control_level == CONTROL_LEVEL_ERROR) ||
-          mt_throttle_tag_level == CONTROL_LEVEL_ERROR)
-      {
-        store_write_throttling_log(thd, i, iter->first, rule);
-        my_error(ER_WRITE_QUERY_THROTTLED, MYF(0));
-        mysql_mutex_unlock(&LOCK_global_write_throttling_rules);
-        DBUG_RETURN(true);
-      }
-      else if ((!thd->variables.write_throttle_tag_only &&
-               (write_control_level == CONTROL_LEVEL_NOTE ||
-                write_control_level == CONTROL_LEVEL_WARN)) ||
-               mt_throttle_tag_level == CONTROL_LEVEL_WARN)
-      {
-        store_write_throttling_log(thd, i, iter->first, rule);
-        push_warning_printf(thd,
-                            (write_control_level == CONTROL_LEVEL_NOTE ||
-                             mt_throttle_tag_level != CONTROL_LEVEL_WARN) ?
-                              Sql_condition::WARN_LEVEL_NOTE :
-                              Sql_condition::WARN_LEVEL_WARN,
-                            ER_WRITE_QUERY_THROTTLED,
-                            ER(ER_WRITE_QUERY_THROTTLED));
+      uint coin_toss = rand() % 100; // 0 <= coin_toss < 100
+      if (coin_toss < rule.throttle_rate) {
+        int mt_throttle_tag_level = thd->get_mt_throttle_tag_level();
+        if (iter->second.mode == WTR_MANUAL ||
+            (!thd->variables.write_throttle_tag_only &&
+            write_control_level == CONTROL_LEVEL_ERROR) ||
+            mt_throttle_tag_level == CONTROL_LEVEL_ERROR)
+        {
+          store_write_throttling_log(thd, i, iter->first, rule);
+          my_error(ER_WRITE_QUERY_THROTTLED, MYF(0));
+          mysql_mutex_unlock(&LOCK_global_write_throttling_rules);
+          DBUG_RETURN(true);
+        }
+        else if ((!thd->variables.write_throttle_tag_only &&
+                (write_control_level == CONTROL_LEVEL_NOTE ||
+                  write_control_level == CONTROL_LEVEL_WARN)) ||
+                mt_throttle_tag_level == CONTROL_LEVEL_WARN)
+        {
+          store_write_throttling_log(thd, i, iter->first, rule);
+          push_warning_printf(thd,
+                              (write_control_level == CONTROL_LEVEL_NOTE ||
+                              mt_throttle_tag_level != CONTROL_LEVEL_WARN) ?
+                                Sql_condition::WARN_LEVEL_NOTE :
+                                Sql_condition::WARN_LEVEL_WARN,
+                              ER_WRITE_QUERY_THROTTLED,
+                              ER(ER_WRITE_QUERY_THROTTLED));
+        }
       }
     }
   }
@@ -9351,13 +9367,15 @@ void add_join_natural(TABLE_LIST *a, TABLE_LIST *b, List<String> *using_fields,
     thd			Thread class
     id			Thread id
     only_kill_query     Should it kill the query or the connection
+    reason  Description about the reason why it was killed
 */
 
 static
-void sql_kill(THD *thd, my_thread_id id, bool only_kill_query)
+void sql_kill(THD *thd, my_thread_id id, bool only_kill_query,
+              const char *reason)
 {
   uint error;
-  if (!(error= thd->kill_one_thread(id, only_kill_query)))
+  if (!(error= thd->kill_one_thread(id, only_kill_query, reason)))
   {
     if (! thd->killed)
       my_ok(thd);

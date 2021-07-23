@@ -21,6 +21,8 @@ The following options may be given as the first argument:
  The legal values are: ALTER, BEGIN, COMMIT, CREATE,
  DELETE, DROP, INSERT, LOAD, SELECT, SET, REPLACE,
  ROLLBACK, TRUNCATE, UPDATE, SHOW and empty string
+ --admission-control-multiquery-filter 
+ Run filter on subsequent queries in multi-query statement
  --admission-control-queue[=#] 
  Determines which queue this request goes to during
  admission control. Allowed values are 0-9, since only 10
@@ -225,6 +227,9 @@ The following options may be given as the first argument:
  --character-sets-dir=name 
  Directory where character sets are
  -r, --chroot=name   Chroot mysqld daemon during startup.
+ --client-attribute-names[=name] 
+ List of supported query/connection attributes to use for
+ for client_attributes (default: caller,async_id).
  --collation-server=name 
  Set the default collation.
  --column-stats-control=name 
@@ -318,6 +323,7 @@ The following options may be given as the first argument:
  This should be used only for testing purposes. This
  option allows enabling gtid_mode on new slave replicating
  from a old master which is not gtid compatible
+ --enable-hlc-bound  Enable HLC bound enforcement for transactional operations
  --enable-jemalloc-hpp[=name] 
  This will provide options for Jemalloc heap profiling.On:
  Activates profilingOff: Deactivate profilingDump: Dump a
@@ -475,6 +481,9 @@ The following options may be given as the first argument:
  --histogram-step-size-update-command=name 
  Step size of the Histogram which is used to track update
  command latencies.
+ --hlc-upper-bound-delta[=#] 
+ Min acceptable difference between current HLC value and
+ upper HLC boundary specified for the query
  --hll-data-size-log2=# 
  This argument is used to generate the hashtable.
  Increasing the data_size will increase the accuracy while
@@ -717,6 +726,8 @@ The following options may be given as the first argument:
  --max-error-count=# Max number of errors/warnings to store for a statement
  --max-heap-table-size=# 
  Don't allow creation of heap tables bigger than this
+ --max-index-stats-entries-per-table[=#] 
+ Maximum number of entries in INDEX_STATISTICS per table
  --max-join-size=#   Joins that are probably going to read more than
  max_join_size records return an error
  --max-length-for-sort-data=# 
@@ -898,6 +909,9 @@ The following options may be given as the first argument:
  --optimizer-full-scan 
  Enable full table and index scans.
  (Defaults to on; use --skip-optimizer-full-scan to disable.)
+ --optimizer-group-by-cost-adjust[=#] 
+ Adjust cost of loose index scan group-by plan by this
+ factor.
  --optimizer-low-limit-heuristic 
  Enable low limit heuristic.
  (Defaults to on; use --skip-optimizer-low-limit-heuristic to disable.)
@@ -1176,6 +1190,9 @@ The following options may be given as the first argument:
  --read-rnd-buffer-size=# 
  When reading rows in sorted order after a sort, the rows
  are read through this buffer to avoid a disk seeks
+ --recover-raft-log  Temprary variable to control recovery of raft log by
+ removing partial trxs. This should be removed later.
+ (Defaults to on; use --skip-recover-raft-log to disable.)
  --relay-log=name    The location and name to use for relay logs
  --relay-log-index=name 
  File that holds the names for relay log files.
@@ -1365,6 +1382,8 @@ The following options may be given as the first argument:
  cache_index_and_filter_blocks_with_high_priority for
  RocksDB
  (Defaults to on; use --skip-rocksdb-cache-index-and-filter-with-high-priority to disable.)
+ --rocksdb-cancel-manual-compactions 
+ Cancelling all ongoing manual compactions.
  --rocksdb-cf-options[=name] 
  Enable or disable ROCKSDB_CF_OPTIONS plugin. Possible
  values are ON, OFF, FORCE (don't start if the plugin
@@ -1489,6 +1508,8 @@ The following options may be given as the first argument:
  Enable rocksdb iterator upper/lower bounds in read
  options.
  (Defaults to on; use --skip-rocksdb-enable-iterate-bounds to disable.)
+ --rocksdb-enable-pipelined-write 
+ DBOptions::enable_pipelined_write for RocksDB
  --rocksdb-enable-remove-orphaned-dropped-cfs 
  Enables removing dropped cfs from metadata if it doesn't
  exist in cf manager
@@ -1577,6 +1598,9 @@ The following options may be given as the first argument:
  DBOptions::log_file_time_to_roll for RocksDB
  --rocksdb-manifest-preallocation-size=# 
  DBOptions::manifest_preallocation_size for RocksDB
+ --rocksdb-manual-compaction-bottommost-level=name 
+ Option for bottommost level compaction during manual
+ compaction
  --rocksdb-manual-compaction-threads=# 
  How many rocksdb threads to run for manual compactions
  --rocksdb-manual-wal-flush 
@@ -1701,6 +1725,9 @@ The following options may be given as the first argument:
  --rocksdb-seconds-between-stat-computes=# 
  Sets a number of seconds to wait between optimizer stats
  recomputation. Only changed indexes will be refreshed.
+ --rocksdb-select-bypass-allow-filters 
+ Allow non-optimal filters in SELECT bypass queries
+ (Defaults to on; use --skip-rocksdb-select-bypass-allow-filters to disable.)
  --rocksdb-select-bypass-debug-row-delay=# 
  Test only to inject delays in bypass select to simulate
  long queries for each row sent
@@ -1920,7 +1947,7 @@ The following options may be given as the first argument:
  COLUMN_TYPE field. This variable is deprecated and will
  be removed in a future release.
  --show-query-digest Show query digest instead of full query in show process
- list.Requres sql_stats_control to be on.
+ list.Requires sql_stats_control to be on.
  --show-slave-auth-info 
  Show user and password in SHOW SLAVE HOSTS on this
  master.
@@ -2141,6 +2168,10 @@ The following options may be given as the first argument:
  related data from memory. OFF_SOFT: Stop collecting the
  statistics, but retain any data collected so far. ON:
  Collect the statistics.
+ --sql-stats-read-control 
+ Controls reading from SQL_STATISTICS, SQL_TEXT and
+ CLIENT_ATTRIBUTES tables.
+ (Defaults to on; use --skip-sql-stats-read-control to disable.)
  --stored-program-cache=# 
  The soft upper limit for number of cached stored routines
  for one connection.
@@ -2334,6 +2365,15 @@ The following options may be given as the first argument:
  manually mitigate replication lag related issues.Check
  out I_S.write_throttling_rules for all active rules.Valid
  values - OFF, [+-][CLIENT|USER|SHARD|SQL_ID]=<value>
+ --write-throttle-permissible-dimensions-in-order[=name] 
+ All the dimensions(SQL_ID, CLIENT, USER, SHARD) that are
+ permitted to beauto throttled in order in case of
+ replication lag.
+ --write-throttle-rate-step[=#] 
+ This variable determines the step by which throttle rate
+ probability is incremented or decremented. Default value
+ is 100 which means an entity is either fully throttled or
+ not throttled at all
  --write-throttle-tag-only 
  If set to true, replication lag throttling will only
  throttle queries with query attribute mt_throttle_okay.
@@ -2351,6 +2391,7 @@ admin-port 0
 admin-users-list 
 admission-control-by-trx FALSE
 admission-control-filter 
+admission-control-multiquery-filter FALSE
 admission-control-queue 0
 admission-control-queue-timeout -1
 admission-control-wait-events 
@@ -2400,6 +2441,7 @@ character-set-filesystem binary
 character-set-server latin1
 character-sets-dir MYSQL_CHARSETSDIR/
 chroot (No default value)
+client-attribute-names caller,async_id
 collation-server latin1_swedish_ci
 column-stats-control OFF_HARD
 commit-consensus-error-action ROLLBACK_TRXS_IN_GROUP
@@ -2430,6 +2472,7 @@ enable-binlog-hlc FALSE
 enable-blind-replace FALSE
 enable-block-stale-hlc-read FALSE
 enable-gtid-mode-on-new-slave-with-old-master FALSE
+enable-hlc-bound FALSE
 enable-jemalloc-hpp OFF
 enable-query-checksum FALSE
 enable-raft-plugin FALSE
@@ -2478,6 +2521,7 @@ histogram-step-size-other-command 16ms
 histogram-step-size-select-command 128us
 histogram-step-size-transaction-command 16ms
 histogram-step-size-update-command 16ms
+hlc-upper-bound-delta 0
 hll-data-size-log2 14
 host-cache-size 279
 ignore-builtin-innodb FALSE
@@ -2557,6 +2601,7 @@ max-digest-length 1024
 max-digest-sample-age -1
 max-error-count 64
 max-heap-table-size 16777216
+max-index-stats-entries-per-table 30
 max-join-size 18446744073709551615
 max-length-for-sort-data 1024
 max-nonsuper-connections 0
@@ -2570,7 +2615,7 @@ max-sort-length 1024
 max-sp-recursion-depth 0
 max-sql-stats-count 100000
 max-sql-stats-size 104857600
-max-sql-text-storage-size 1024
+max-sql-text-storage-size 4096
 max-tmp-disk-usage 0
 max-tmp-tables 32
 max-user-connections 0
@@ -2617,6 +2662,7 @@ old-passwords 0
 old-style-user-limits FALSE
 optimizer-force-index-for-range FALSE
 optimizer-full-scan TRUE
+optimizer-group-by-cost-adjust 1
 optimizer-low-limit-heuristic TRUE
 optimizer-prune-level 1
 optimizer-search-depth 62
@@ -2700,6 +2746,7 @@ read-only FALSE
 read-only-error-msg-extra 
 read-only-slave TRUE
 read-rnd-buffer-size 262144
+recover-raft-log TRUE
 relay-log (No default value)
 relay-log-index (No default value)
 relay-log-info-file relay-log.info
@@ -2740,6 +2787,7 @@ rocksdb-cache-dump TRUE
 rocksdb-cache-high-pri-pool-ratio 0
 rocksdb-cache-index-and-filter-blocks TRUE
 rocksdb-cache-index-and-filter-with-high-priority TRUE
+rocksdb-cancel-manual-compactions FALSE
 rocksdb-cf-options ON
 rocksdb-cfstats ON
 rocksdb-checksums-pct 100
@@ -2778,6 +2826,7 @@ rocksdb-enable-2pc TRUE
 rocksdb-enable-bulk-load-api TRUE
 rocksdb-enable-insert-with-update-caching TRUE
 rocksdb-enable-iterate-bounds TRUE
+rocksdb-enable-pipelined-write FALSE
 rocksdb-enable-remove-orphaned-dropped-cfs TRUE
 rocksdb-enable-thread-tracking TRUE
 rocksdb-enable-ttl TRUE
@@ -2806,6 +2855,7 @@ rocksdb-lock-wait-timeout 1
 rocksdb-locks ON
 rocksdb-log-file-time-to-roll 0
 rocksdb-manifest-preallocation-size 4194304
+rocksdb-manual-compaction-bottommost-level kForceOptimized
 rocksdb-manual-compaction-threads 0
 rocksdb-manual-wal-flush TRUE
 rocksdb-master-skip-tx-api FALSE
@@ -2844,6 +2894,7 @@ rocksdb-records-in-range 0
 rocksdb-reset-stats FALSE
 rocksdb-rollback-on-timeout FALSE
 rocksdb-seconds-between-stat-computes 3600
+rocksdb-select-bypass-allow-filters TRUE
 rocksdb-select-bypass-debug-row-delay 0
 rocksdb-select-bypass-fail-unsupported TRUE
 rocksdb-select-bypass-log-failed FALSE
@@ -2972,6 +3023,7 @@ sql-plans-capture-frequency 1
 sql-plans-capture-slow-query FALSE
 sql-plans-control OFF_HARD
 sql-stats-control OFF_HARD
+sql-stats-read-control TRUE
 stored-program-cache 256
 super-read-only FALSE
 symbolic-links FALSE
@@ -3030,6 +3082,8 @@ write-throttle-lag-pct-min-secondaries 100
 write-throttle-min-ratio 1000
 write-throttle-monitor-cycles 1000
 write-throttle-patterns OFF
+write-throttle-permissible-dimensions-in-order OFF
+write-throttle-rate-step 100
 write-throttle-tag-only FALSE
 write-time-check-batch 0
 zstd-net-compression-level 3

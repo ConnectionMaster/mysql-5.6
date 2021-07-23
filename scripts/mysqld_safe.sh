@@ -76,6 +76,7 @@ Usage: $0 [OPTIONS]
   --core-file-size=LIMIT     Limit core files to the specified size
   --timezone=TZ              Set the system timezone
   --malloc-lib=LIB           Preload shared library LIB if available
+  --malloc-conf=OPTIONS      MALLOC_CONF env options
   --ld-preload-lib=LIB       Preload shared library LIB
   --mysqld=FILE              Use the specified file as mysqld
   --mysqld-version=VERSION   Use "mysqld-VERSION" as mysqld
@@ -241,6 +242,7 @@ parse_arguments() {
           exit 1
         fi
         add_mysqld_ld_preload "$val" ;;
+      --malloc-conf=*) malloc_conf_options="$val" ;;
       --mysqld=*)
         if [ -z "$pick_args" ]; then
           log_error "--mysqld option can only be used as command line option, found in config file"
@@ -490,7 +492,7 @@ else
 fi
 
 if test -z "$MYSQL_HOME"
-then 
+then
   if test -r "$MY_BASEDIR_VERSION/my.cnf" && test -r "$DATADIR/my.cnf"
   then
     log_error "WARNING: Found two instances of my.cnf -
@@ -595,7 +597,7 @@ then
 
     # mysqld does not add ".err" to "--log-error=foo."; it considers a
     # trailing "." as an extension
-    
+
     if expr "$err_log" : '.*\.[^/]*$' > /dev/null
     then
         :
@@ -943,6 +945,12 @@ do
   cmd="$cmd "`shell_quote_string "$i"`
 done
 cmd="$cmd $args"
+
+if [ -n "$malloc_conf_options" ]
+then
+  cmd="MALLOC_CONF=$malloc_conf_options $cmd"
+fi
+
 cmd_skip_core="$cmd --skip-core-file"
 # Avoid 'nohup: ignoring input' warning
 test -n "$NOHUP_NICENESS" && cmd="$cmd < /dev/null" \
@@ -960,6 +968,10 @@ have_sleep=1
 
 skip_core=0
 last_crash=0
+
+cur_retry_times=0
+max_restart_a_day=10
+prev_date=`date +%D`
 
 while true
 do
@@ -1045,6 +1057,41 @@ do
   fi
   last_crash=$cur_crash
 
+  # stop retrying too ofen and rocksdb filling up txlogs
+  #
+  # 1. Reset current retry times in a new day
+  cur_date=`date +%D`
+  if test $cur_date != $prev_date
+  then
+    cur_retry_times=0
+    prev_date=`date +%D`
+  fi
+
+  # 2. Sleep 2,4,8,16... seconds between restart
+  #    Sleep 24 hours if reaching 10 retries in a day
+  cur_retry_times=`expr $cur_retry_times + 1`
+  if test ! -f /tmp/disable_mysqld_restart_throttle \
+    && test "$cur_retry_times" -gt "$max_restart_a_day"
+  then
+    log_notice "Throttling restart after 10 restarts: Sleep 1 day"
+    sleep 86400
+    if [ $? == 137 ];
+    then
+      log_notice "Sleep was likely interrupted from outside. Will exit loop"
+      break
+    fi
+  else
+    sleep_time=$((2**${cur_retry_times}))
+    log_notice "Throttling restart after $cur_retry_times restarts: Sleep $sleep_time seconds"
+    sleep $sleep_time
+    if [ $? == 137 ];
+    then
+      log_notice "Sleep was likely interrupted from outside. Will exit loop"
+      break
+    fi
+  fi
+
+  # Note: the following code is not needed after exponential backoff
   # sanity check if time reading is sane and there's sleep
   if test $end_time -gt 0 -a $have_sleep -gt 0
   then
@@ -1082,8 +1129,8 @@ do
     log_notice "Number of processes running now: $numofproces"
     I=1
     while test "$I" -le "$numofproces"
-    do 
-      PROC=`ps xaww | grep "$ledir/$MYSQLD\>" | grep -v "grep" | grep "pid-file=$pid_file" | sed -n '$p'` 
+    do
+      PROC=`ps xaww | grep "$ledir/$MYSQLD\>" | grep -v "grep" | grep "pid-file=$pid_file" | sed -n '$p'`
 
       for T in $PROC
       do
@@ -1103,4 +1150,3 @@ do
 done
 
 log_notice "mysqld from pid file $pid_file ended"
-

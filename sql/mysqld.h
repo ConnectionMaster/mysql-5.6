@@ -320,7 +320,7 @@ extern bool opt_disable_networking, opt_skip_show_db;
 extern bool opt_skip_name_resolve;
 extern bool opt_ignore_builtin_innodb;
 extern my_bool opt_character_set_client_handshake;
-extern MYSQL_PLUGIN_IMPORT bool volatile abort_loop;
+extern bool volatile abort_loop;
 extern bool in_bootstrap;
 extern my_bool opt_bootstrap;
 extern char *opt_rbr_idempotent_tables;
@@ -338,6 +338,7 @@ extern ulonglong opt_slave_dump_thread_wait_sleep_usec;
 extern my_bool rpl_wait_for_semi_sync_ack;
 extern std::atomic<ulonglong> slave_lag_sla_misses;
 extern ulonglong opt_slave_lag_sla_seconds;
+extern std::atomic<ulonglong> slave_commit_order_deadlocks;
 extern ulong slave_exec_mode_options;
 extern ulong slave_use_idempotent_for_recovery_options;
 extern ulong slave_run_triggers_for_rbr;
@@ -346,6 +347,7 @@ extern char* opt_rbr_column_type_mismatch_whitelist;
 extern ulonglong admission_control_filter;
 extern ulonglong admission_control_wait_events;
 extern ulonglong admission_control_yield_freq;
+extern my_bool admission_control_multiquery_filter;
 extern my_bool read_only, opt_readonly, super_read_only, opt_super_readonly;
 extern char* opt_read_only_error_msg_extra;
 extern my_bool skip_master_info_check_for_read_only_error_msg_extra;
@@ -448,6 +450,7 @@ extern bool maintain_database_hlc;
 extern ulong wait_for_hlc_timeout_ms;
 extern ulong wait_for_hlc_sleep_threshold_ms;
 extern double wait_for_hlc_sleep_scaling_factor;
+extern ulonglong hlc_upper_bound_delta;
 extern my_bool async_query_counter_enabled;
 extern my_bool enable_acl_fast_lookup;
 extern my_bool use_cached_table_stats_ptr;
@@ -460,6 +463,7 @@ extern ulonglong minimum_hlc_ns;
 /* Maximum allowed forward drift in the HLC as compared to wall clock */
 extern ulonglong maximum_hlc_drift_ns;
 extern bool enable_raft_plugin;
+extern bool recover_raft_log;
 extern bool disable_raft_log_repointing;
 extern bool override_enable_raft_check;
 extern ulong opt_raft_signal_async_dump_threads;
@@ -1049,14 +1053,19 @@ extern double write_throttle_min_ratio;
 extern uint write_throttle_monitor_cycles;
 extern uint write_throttle_lag_pct_min_secondaries;
 extern ulong write_auto_throttle_frequency;
+extern uint write_throttle_rate_step;
 extern uint write_stats_count;
 extern char *latest_write_throttling_rule;
+extern char *latest_write_throttle_permissible_dimensions_in_order;
+extern std::vector<enum_wtr_dimension> write_throttle_permissible_dimensions_in_order;
 extern GLOBAL_WRITE_THROTTLING_RULES_MAP global_write_throttling_rules;
 extern uint transaction_size_histogram_width;
 extern uint write_statistics_histogram_width;
 extern std::list<std::pair<std::string, enum_wtr_dimension>> currently_throttled_entities;
 extern WRITE_MONITORED_ENTITY currently_monitored_entity;
 extern std::atomic<time_t> last_replication_lag_check_time;
+extern std::vector<std::string> client_attribute_names;
+extern char *latest_client_attribute_names;
 
 /* This field dictates the maximum number of entries in the
    information_schema.DB_STATISTICS table */
@@ -1220,6 +1229,9 @@ extern ulong sql_duplicate_executions_control;
 
 /* Controls whether special privileges are needed for accessing MT tables */
 extern my_bool mt_tables_access_control;
+
+/* Maximum number of index stats to maintain for each table */
+extern uint max_index_stats_entries_per_table;
 
 enum enum_gtid_mode
 {

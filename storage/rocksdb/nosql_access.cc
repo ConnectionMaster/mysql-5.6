@@ -46,8 +46,7 @@
 #include "./rdb_converter.h"
 #include "./rdb_datadic.h"
 
-static const size_t MAX_NOSQL_FIELD_COUNT = 16;
-static const size_t MAX_NOSQL_ITEM_COUNT = 16;
+static const size_t DEFAULT_FIELD_LIST_SIZE = 16;
 static const size_t MAX_NOSQL_COND_COUNT = 16;
 static const size_t MAX_SIZE = std::numeric_limits<size_t>::max();
 
@@ -162,7 +161,7 @@ class select_parser {
     str += ", ";
     str += "Fields={ ";
 
-    for (uint i = 0; i < m_field_count; ++i) {
+    for (uint i = 0; i < m_field_list.size(); ++i) {
       auto field = m_field_list[i];
       if (i) {
         str += ", ";
@@ -251,10 +250,9 @@ class select_parser {
   st_select_lex *get_select_lex() const { return m_select_lex; }
   uint get_index() const { return m_index; }
   bool is_order_desc() const { return m_is_order_desc; }
-  Field *const *get_field_list() const { return m_field_list; }
+  const std::vector<Field *> &get_field_list() const { return m_field_list; }
   const sql_cond *get_cond_list() const { return m_cond_list; }
-  uint get_field_count() const { return m_field_count; }
-  uint get_cond_count() const { return m_cond_count; }
+  size_t get_cond_count() const { return m_cond_count; }
   uint64_t get_select_limit() const { return m_select_limit; }
   uint64_t get_offset_limit() const { return m_offset_limit; }
   const char *get_error_msg() const { return m_error_msg; }
@@ -267,8 +265,7 @@ class select_parser {
 
   uint m_index;
   bool m_is_order_desc;
-  Field *m_field_list[MAX_NOSQL_ITEM_COUNT];
-  uint m_field_count = 0;
+  std::vector<Field *> m_field_list;
   sql_cond m_cond_list[MAX_NOSQL_COND_COUNT];
   uint m_cond_count = 0;
   uint64_t m_select_limit;
@@ -314,14 +311,11 @@ class select_parser {
 
   // Parse all items in SELECT
   bool parse_items() {
-    if (m_table->s->fields > MAX_NOSQL_FIELD_COUNT) {
-      m_error_msg = "Too many fields in table";
-      return true;
-    }
-
     // All item must be fields
     Item *item;
     List_iterator_fast<Item> li(m_select_lex->item_list);
+
+    m_field_list.reserve(DEFAULT_FIELD_LIST_SIZE);
     while ((item = li++)) {
       auto type = item->type();
       if (type != Item::FIELD_ITEM) {
@@ -346,10 +340,11 @@ class select_parser {
 
       auto field_type = field->real_type();
       if (field_type == MYSQL_TYPE_VARCHAR &&
+          field->charset() != &my_charset_bin &&
           field->charset() != &my_charset_utf8_bin &&
           field->charset() != &my_charset_latin1_bin) {
         m_error_msg =
-            "only utf8_bin, latin1_bin is supported for varchar field";
+            "only binary, utf8_bin, latin1_bin is supported for varchar field";
         return true;
       }
 
@@ -357,12 +352,7 @@ class select_parser {
       // item->send
       field_item->set_field(m_thd, field);
 
-      if (m_field_count >= MAX_NOSQL_ITEM_COUNT) {
-        m_error_msg = "Too many SELECT expressions";
-        return true;
-      }
-
-      m_field_list[m_field_count++] = field;
+      m_field_list.push_back(field);
     }
 
     return false;
@@ -624,7 +614,8 @@ class select_exec {
     m_index = parser.get_index();
     m_index_info = &m_table->key_info[m_index];
     m_pk_info = &m_table->key_info[m_table_share->primary_key];
-    m_use_full_key = true;
+    m_is_point_query = true;
+    m_start_full_key = m_end_full_key = true;
     m_ddl_manager = rdb_get_ddl_manager();
     m_index_is_pk = (m_index == m_table_share->primary_key);
     m_handler = static_cast<ha_rocksdb *>(m_table->file);
@@ -639,11 +630,21 @@ class select_exec {
                           std::make_pair(MAX_SIZE, MAX_SIZE));
     m_debug_row_delay = get_select_bypass_debug_row_delay();
 
-    memset(reinterpret_cast<char *>(m_field_index_to_where.data()), 0xff,
-           sizeof(m_field_index_to_where));
+    m_field_index_to_where.resize(m_table_share->fields,
+                                  std::make_pair(-1, -1));
+    m_start_inclusive = m_end_inclusive = true;
+    m_unsupported = false;
+    m_error_msg = "UNKNOWN";
+
+    m_lookup_bitmap = {nullptr, 0, 0, nullptr, nullptr};
   }
 
+  ~select_exec() { bitmap_free(&m_lookup_bitmap); }
+
   bool run();
+
+  bool is_unsupported() { return m_unsupported; }
+  const char *get_error_msg() { return m_error_msg; }
 
  private:
   /*
@@ -658,23 +659,17 @@ class select_exec {
     }
 
     bool start() {
-      // We need get ReadOptions from tx in case the snapshot was already
-      // created by someone else
-      m_ro = rdb_tx_acquire_snapshot(m_tx);
+      rdb_tx_acquire_snapshot(m_tx);
 
       return false;
     }
 
-    void set_seek_mode(bool use_bloom) {
-      if (use_bloom) {
-        m_ro.prefix_same_as_start = true;
-      } else {
-        m_ro.total_order_seek = true;
-      }
-    }
-
-    rocksdb::Iterator *get_iterator(rocksdb::ColumnFamilyHandle *cf) {
-      return rdb_tx_get_iterator(m_tx, m_ro, cf);
+    rocksdb::Iterator *get_iterator(rocksdb::ColumnFamilyHandle *cf,
+                                    bool use_bloom,
+                                    const rocksdb::Slice &lower_bound,
+                                    const rocksdb::Slice &upper_bound) {
+      return rdb_tx_get_iterator(m_tx, cf, !use_bloom, true /* fill_cache */,
+                                 lower_bound, upper_bound);
     }
 
     rocksdb::Status get(rocksdb::ColumnFamilyHandle *cf,
@@ -704,18 +699,29 @@ class select_exec {
    private:
     THD *m_thd;
     Rdb_transaction *m_tx;
-    rocksdb::ReadOptions m_ro;
   };
 
   struct key_index_tuple_writer {
-    Rdb_string_writer writer;  // The KeyIndexTuple
-    uint eq_len;               // Length of prefix key
+    Rdb_string_writer start;  // Start KeyIndexTuple
+    uint eq_len;              // Length of prefix key
+    Rdb_string_writer end;    // End KeyIndexTuple, only used for ranges
 
-    rocksdb::Slice to_key_slice() { return writer.to_slice(); }
+    // Get the slice for packed key - point query only
+    rocksdb::Slice get_key_slice() {
+      DBUG_ASSERT(end.is_empty());
+      return start.to_slice();
+    }
 
-    rocksdb::Slice to_eq_slice() {
-      DBUG_ASSERT(eq_len <= writer.get_current_pos());
-      return rocksdb::Slice(reinterpret_cast<char *>(writer.ptr()), eq_len);
+    // Get the start range for packed key - range query only
+    rocksdb::Slice get_start_key_slice() { return start.to_slice(); }
+
+    // Get the end range for packed key - range query only
+    rocksdb::Slice get_end_key_slice() { return end.to_slice(); }
+
+    // Return slice for prefix range query
+    rocksdb::Slice get_eq_slice() {
+      DBUG_ASSERT(eq_len <= start.get_current_pos());
+      return rocksdb::Slice(reinterpret_cast<char *>(start.ptr()), eq_len);
     }
   };
 
@@ -723,18 +729,19 @@ class select_exec {
   void scan_value();
   bool run_query();
   bool run_range_query(txn_wrapper *txn);
-  bool unpack_for_sk(txn_wrapper *txn, rocksdb::Slice rkey,
-                     rocksdb::Slice rvalue);
-  bool unpack_for_pk(rocksdb::Slice rkey, rocksdb::Slice rvalue);
+  bool unpack_for_sk(txn_wrapper *txn, const rocksdb::Slice &rkey,
+                     const rocksdb::Slice &rvalue);
+  bool unpack_for_pk(const rocksdb::Slice &rkey, const rocksdb::Slice &rvalue);
   bool eval_cond();
   int eval_and_send();
   bool run_pk_point_query(txn_wrapper *txn);
   bool run_sk_point_query(txn_wrapper *txn);
   bool pack_index_tuple(uint key_part_no, Rdb_string_writer *writer,
                         const Field *field, Item *item);
-  bool pack_cond(uint key_part_no, const sql_cond &cond);
+  bool pack_cond(uint key_part_no, const sql_cond &cond, bool is_start = true);
   bool send_row();
-  bool use_bloom_filter(rocksdb::Slice eq_slice);
+
+  bool setup_iterator(txn_wrapper *txn, const rocksdb::Slice &eq_slice);
 
   bool handle_killed() {
     if (m_thd->killed) {
@@ -761,6 +768,10 @@ class select_exec {
   KEY *m_index_info;
   KEY *m_pk_info;
 
+  // Current query is not supported
+  bool m_unsupported;
+  const char *m_error_msg;
+
   // All filters (such as A=1)
   uint m_filter_list[MAX_NOSQL_COND_COUNT];
   uint m_filter_count = 0;
@@ -769,16 +780,20 @@ class select_exec {
   std::vector<key_index_tuple_writer> m_key_index_tuples;
 
   // map from field_index to where_list
-  std::array<std::pair<int, int>, MAX_NOSQL_FIELD_COUNT> m_field_index_to_where;
-
-  // Number of fields (columns) that are prefix of index
-  uint m_prefix_key_count;
+  std::vector<std::pair<int, int>> m_field_index_to_where;
 
   // The iterator used in secondary index query or range query
   std::unique_ptr<rocksdb::Iterator> m_scan_it;
 
-  // The entire index is used in query - meaning it is a point query
-  bool m_use_full_key;
+  // The entire index (including extended keyparts) is used in query in equality
+  // predicates - meaning it is a point query
+  bool m_is_point_query;
+
+  // The start key uses full key (including extended keyparts)
+  bool m_start_full_key;
+
+  // The end key uses full key (including extended keyparts)
+  bool m_end_full_key;
 
   // We need to unpack the given index (primary or secondary) as indicated
   // in WHERE clause
@@ -790,6 +805,9 @@ class select_exec {
 
   // We need to unpack the value
   bool m_unpack_value;
+
+  // We may need to only read keys
+  bool m_keyread_only;
 
   // If the given index is primary index
   bool m_index_is_pk;
@@ -828,6 +846,19 @@ class select_exec {
   // LIMIT lower bound
   // For LIMIT offset, row_count, this is offset
   uint64_t m_offset_limit;
+
+  // Whether the range query (begin, end) is inclusive in begin/end
+  bool m_start_inclusive;
+  bool m_end_inclusive;
+
+  // Lookup bitmap for covering check
+  MY_BITMAP m_lookup_bitmap;
+
+  // Upper and lower bounds for iterators
+  std::vector<uchar> m_lower_bound_buf;
+  std::vector<uchar> m_upper_bound_buf;
+  rocksdb::Slice m_lower_bound_slice;
+  rocksdb::Slice m_upper_bound_slice;
 };
 
 bool select_exec::pack_index_tuple(uint key_part_no, Rdb_string_writer *writer,
@@ -900,16 +931,21 @@ bool select_exec::pack_index_tuple(uint key_part_no, Rdb_string_writer *writer,
   return false;
 }
 
-bool inline select_exec::pack_cond(uint key_part_no, const sql_cond &cond) {
-  if (likely(m_key_index_tuples.size() == 1)) {
-    // Optimize for the common case
-    if (pack_index_tuple(key_part_no, &m_key_index_tuples[0].writer, cond.field,
-                         cond.val_item)) {
-      return true;
+bool inline select_exec::pack_cond(uint key_part_no, const sql_cond &cond,
+                                   bool is_start) {
+  if (is_start) {
+    // Start key in range query or key in point query
+    for (auto &entry : m_key_index_tuples) {
+      if (pack_index_tuple(key_part_no, &entry.start, cond.field,
+                           cond.val_item)) {
+        return true;
+      }
     }
   } else {
-    for (auto &writer : m_key_index_tuples) {
-      if (pack_index_tuple(key_part_no, &writer.writer, cond.field,
+    // End key in range query
+    for (auto &entry : m_key_index_tuples) {
+      DBUG_ASSERT(!entry.end.is_empty());
+      if (pack_index_tuple(key_part_no, &entry.end, cond.field,
                            cond.val_item)) {
         return true;
       }
@@ -947,7 +983,8 @@ bool INLINE_ATTR select_exec::scan_where() {
       // We have multiple sql_cond for the same field
       if (index_pair.second != -1) {
         // We've already seen 2 of conditions already - fail
-        m_handler->print_error(ER_NOT_SUPPORTED_YET, 0);
+        m_unsupported = true;
+        m_error_msg = "Unsupported range query pattern";
         return true;
       }
 
@@ -957,8 +994,8 @@ bool INLINE_ATTR select_exec::scan_where() {
 
   // We start with just one KeyIndexTuple to pack
   m_key_index_tuples.emplace_back();
-  m_key_index_tuples[0].writer.reserve(m_key_def->max_storage_fmt_length());
-  m_key_index_tuples[0].writer.write_uint32(m_key_def->get_index_number());
+  m_key_index_tuples[0].start.reserve(m_key_def->max_storage_fmt_length());
+  m_key_index_tuples[0].start.write_uint32(m_key_def->get_index_number());
 
   // Scan the index sequentially, and pack the prefix key as we go
   // We stop building the the key if we see a gap, rest become filters.
@@ -980,7 +1017,9 @@ bool INLINE_ATTR select_exec::scan_where() {
   // WHERE A=1 AND B=2 AND C>3:
   //   KeyIndexTuples = {(1, 2, 3)}, Filters = {C>3}, prefix_key_count = 2
   bool eq_only = true;
-  m_prefix_key_count = 0;
+  uint prefix_key_count = 0;
+  uint start_key_count = 0;
+  uint end_key_count = 0;
   uint key_part_no = 0;
   for (; key_part_no < m_index_info->actual_key_parts; ++key_part_no) {
     auto &key_part = m_index_info->key_part[key_part_no];
@@ -997,8 +1036,8 @@ bool INLINE_ATTR select_exec::scan_where() {
         }
 
         if (eq_only) {
-          // Remember number of prefix keys
-          m_prefix_key_count++;
+          // Remember how many key part in where eq(prefix)
+          prefix_key_count++;
 
           // Remember we've processed this condition already
           // Anything we haven't processed here become filters
@@ -1012,6 +1051,9 @@ bool INLINE_ATTR select_exec::scan_where() {
           break;
         }
 
+        // Remember number of prefix keys
+        prefix_key_count++;
+
         // In the IN case if we are building a prefix key we need to
         // multiply the key slices, so that A=1, B IN (2, 3) becomes
         // (1, 2) and (1, 3)
@@ -1023,10 +1065,11 @@ bool INLINE_ATTR select_exec::scan_where() {
         std::vector<key_index_tuple_writer> new_writers;
         new_writers.reserve(KEY_WRITER_DEFAULT_SIZE);
         for (uint i = 0; i < prev_size; ++i) {
+          DBUG_ASSERT(m_key_index_tuples[i].end.is_empty());
           for (uint j = 1; j < in_elem_count; ++j) {
             new_writers.emplace_back(m_key_index_tuples[i]);
             if (pack_index_tuple(key_part_no,
-                                 &new_writers[new_writers.size() - 1].writer,
+                                 &new_writers[new_writers.size() - 1].start,
                                  cond.field, args[j])) {
               return true;
             }
@@ -1043,68 +1086,114 @@ bool INLINE_ATTR select_exec::scan_where() {
       }
 
       // Process >, >=, <, <=
-
       if (eq_only) {
         // We now start to build range query initial position
         // Remeber eq_len at this point - this is the prefix
         // However we do need to keep going
         for (uint i = 0; i < m_key_index_tuples.size(); ++i) {
           m_key_index_tuples[i].eq_len =
-              m_key_index_tuples[i].writer.get_current_pos();
+              m_key_index_tuples[i].start.get_current_pos();
         }
         eq_only = false;
       }
 
-      // >, >=, <, <=
-      int begin_id = -1, end_id = -1;
+      // Figure out (start, end) range for range query
+      int start_id = -1, end_id = -1;
+      bool start_inclusive = false, end_inclusive = false;
       if (cond.op_type == Item_func::GT_FUNC ||
           cond.op_type == Item_func::GE_FUNC) {
-        begin_id = index_pair.first;
-      } else {
+        start_id = index_pair.first;
+        if (cond.op_type == Item_func::GE_FUNC) {
+          start_inclusive = true;
+        }
+      } else if (cond.op_type == Item_func::LE_FUNC ||
+                 cond.op_type == Item_func::LT_FUNC) {
         end_id = index_pair.first;
+        if (cond.op_type == Item_func::LE_FUNC) {
+          end_inclusive = true;
+        }
+      } else {
+        // Unsupported operator - go to filters
+        break;
       }
 
       if (index_pair.second >= 0) {
         auto &second_cond = where_list[index_pair.second];
         if (second_cond.op_type == Item_func::GT_FUNC ||
             second_cond.op_type == Item_func::GE_FUNC) {
-          if (begin_id != -1) {
-            // TODO(yzha) - we have two GT/GE - choose the smaller one
-            DBUG_ASSERT(false);
+          if (start_id != -1) {
+            m_unsupported = true;
+            m_error_msg = "Unsupported range query pattern";
             return true;
           } else {
-            begin_id = index_pair.second;
+            start_id = index_pair.second;
+            if (second_cond.op_type == Item_func::GE_FUNC) {
+              start_inclusive = true;
+            }
           }
-        } else {
+        } else if (second_cond.op_type == Item_func::LE_FUNC ||
+                   second_cond.op_type == Item_func::LT_FUNC) {
           if (end_id != -1) {
-            // TODO(yzha) - we have two LT/LE - choose the bigger one
-            DBUG_ASSERT(false);
+            m_unsupported = true;
+            m_error_msg = "Unsupported range query pattern";
             return true;
           } else {
             end_id = index_pair.second;
+            if (second_cond.op_type == Item_func::LE_FUNC) {
+              end_inclusive = true;
+            }
+          }
+        } else {
+          // Unsupported operator - go to filters
+          break;
+        }
+      }
+
+      // Process the range
+      DBUG_ASSERT(start_id >= 0 || end_id >= 0);
+      // This ensures we always go from start -> end regardless of ordering
+      if (m_parser.is_order_desc()) {
+        std::swap(start_id, end_id);
+        std::swap(start_inclusive, end_inclusive);
+      }
+
+      start_key_count = end_key_count = prefix_key_count;
+
+      if (end_id >= 0) {
+        // end key should start from prefix of start key, which is
+        // the current value of start key before appending the condition
+        for (auto &entry : m_key_index_tuples) {
+          if (entry.end.is_empty()) {
+            entry.end = entry.start;
           }
         }
       }
-
-      // pick the initial position based on column family sorting and ordering
-      int initial_id;
-      if (m_parser.is_order_desc()) {
-        initial_id = end_id;
-      } else {
-        initial_id = begin_id;
-      }
-
-      if (initial_id >= 0) {
-        if (pack_cond(key_part_no, where_list[initial_id])) {
+      if (start_id >= 0) {
+        // Mark the where condition as processed so that they don't go into
+        // filters - there is no point evaluating them since we already
+        // accounted for them in (start, end) range
+        where_list_processed[start_id] = true;
+        m_start_inclusive = start_inclusive;
+        if (pack_cond(key_part_no, where_list[start_id], true /* is_start */)) {
           return true;
         }
-      } else {
-        // There is no corresponding operator to build our starting slice
-        // We stop building the KeyIndexTuple - all the remaining are going to
-        // be filters
-        break;
+        start_key_count++;
+      }
+      if (end_id >= 0) {
+        // Mark the where condition as processed so that they don't go into
+        // filters
+        where_list_processed[end_id] = true;
+        m_end_inclusive = end_inclusive;
+        if (pack_cond(key_part_no, where_list[end_id], false /* is_end */)) {
+          return true;
+        }
+        end_key_count++;
       }
 
+      // We already processed a range and we don't support cases like A >= 1 and
+      // B >= 2
+      key_part_no++;
+      break;
     } else {
       // We stop building the KeyIndexTuple - all the remaining are going to be
       // filters
@@ -1112,36 +1201,19 @@ bool INLINE_ATTR select_exec::scan_where() {
     }
   }
 
-  // Sort the key in index order
+  // Sort the key in index order to ensure the query output is also in
+  // correct index order
   if (!m_parser.is_order_desc()) {
     std::sort(
         m_key_index_tuples.begin(), m_key_index_tuples.end(),
         [](const key_index_tuple_writer &l, const key_index_tuple_writer &r) {
-          size_t l_size = l.writer.get_current_pos();
-          size_t r_size = r.writer.get_current_pos();
-          size_t size = std::min(l_size, r_size);
-
-          int diff = memcmp(l.writer.ptr(), r.writer.ptr(), size);
-          if (diff == 0) {
-            return (l_size < r_size);
-          }
-
-          return diff < 0;
+          return l.start < r.start;
         });
   } else {
     std::sort(
         m_key_index_tuples.begin(), m_key_index_tuples.end(),
         [](const key_index_tuple_writer &l, const key_index_tuple_writer &r) {
-          size_t l_size = l.writer.get_current_pos();
-          size_t r_size = r.writer.get_current_pos();
-          size_t size = std::min(l_size, r_size);
-
-          int diff = memcmp(l.writer.ptr(), r.writer.ptr(), size);
-          if (diff == 0) {
-            return (l_size >= r_size);
-          }
-
-          return diff > 0;
+          return l.start > r.start;
         });
   }
 
@@ -1150,20 +1222,31 @@ bool INLINE_ATTR select_exec::scan_where() {
       std::unique(
           m_key_index_tuples.begin(), m_key_index_tuples.end(),
           [](const key_index_tuple_writer &l, const key_index_tuple_writer &r) {
-            return l.writer.get_current_pos() == r.writer.get_current_pos() &&
-                   memcmp(l.writer.ptr(), r.writer.ptr(),
-                          l.writer.get_current_pos()) == 0;
+            return l.start == r.start && l.end == r.end;
           }),
       m_key_index_tuples.end());
 
   if (eq_only) {
     for (uint i = 0; i < m_key_index_tuples.size(); ++i) {
       m_key_index_tuples[i].eq_len =
-          m_key_index_tuples[i].writer.get_current_pos();
+          m_key_index_tuples[i].start.get_current_pos();
     }
+    start_key_count = prefix_key_count;
+    end_key_count = prefix_key_count;
   }
 
-  m_use_full_key = (key_part_no == m_index_info->actual_key_parts && eq_only);
+  // This is TRICKY:
+  // actual_key_parts can be SK+PK in SQL layer if SK is non-unique,
+  // otherwise it is only SK in SQL layer if SK is unique.
+  // key_def->m_key_parts always has SK+PK
+  // For m_is_point_query check we need to see it has both SK+PK for
+  // SK point lookup and bloom filter check, since bloom filter
+  // has a special optimization that allows bloom filter use even if
+  // eq_cond length is less than prefix length
+  m_is_point_query = (prefix_key_count == m_key_def->get_key_parts());
+  DBUG_ASSERT_IMP(m_is_point_query, eq_only);
+  m_start_full_key = (start_key_count == m_key_def->get_key_parts());
+  m_end_full_key = (end_key_count == m_key_def->get_key_parts());
 
   // Build list of all filters
   // Any condition we haven't processed in prefix key are filters
@@ -1179,11 +1262,17 @@ bool INLINE_ATTR select_exec::scan_where() {
     }
   }
 
-  return false;
-}
+  if (!should_allow_filters_select_bypass() && m_filter_count > 0 &&
+      key_part_no < m_index_info->user_defined_key_parts) {
+    // Only support filter usage in well supported cases such as point query
+    // or simple range query where key is fully specified with well defined
+    // (start, end) with only the last column is a range
+    m_unsupported = true;
+    m_error_msg = "Non-optimal queries with filters are not allowed";
+    return true;
+  }
 
-bool select_exec::use_bloom_filter(rocksdb::Slice eq_slice) {
-  return can_use_bloom_filter(m_thd, *m_key_def, eq_slice, m_use_full_key);
+  return false;
 }
 
 /*
@@ -1194,44 +1283,35 @@ void INLINE_ATTR select_exec::scan_value() {
   m_unpack_index = false;
   m_unpack_pk = false;
   m_unpack_value = false;
-  auto field_list = m_parser.get_field_list();
 
 #ifndef DBUG_OFF
-  for (uint i = 0; i < m_parser.get_field_count(); i++) {
+  const auto &field_list = m_parser.get_field_list();
+  for (uint i = 0; i < field_list.size(); i++) {
     DBUG_ASSERT(bitmap_is_set(m_table->read_set, field_list[i]->field_index));
   }
 #endif
 
-  // Scan the given index
   std::vector<bool> index_cover_bitmap(m_table_share->fields, false);
   for (uint i = 0; i < m_index_info->actual_key_parts; ++i) {
-    if (m_key_def->can_unpack(i)) {
+    if (m_key_def->get_pack_info(i)->m_covered) {
       index_cover_bitmap[m_index_info->key_part[i].field->field_index] = true;
     }
   }
 
-  // Scan the secondary index in case of given index is primary index
-  std::vector<bool> pk_cover_bitmap(m_table_share->fields, false);
-  if (!m_index_is_pk) {
-    for (uint i = 0; i < m_pk_info->actual_key_parts; ++i) {
-      if (m_pk_def->can_unpack(i)) {
-        pk_cover_bitmap[m_pk_info->key_part[i].field->field_index] = true;
-      }
+  m_keyread_only = true;
+  for (uint i = 0; i < m_table_share->fields; i++) {
+    if (bitmap_is_set(m_table->read_set, i) && !index_cover_bitmap[i]) {
+      m_keyread_only = false;
+      break;
     }
   }
 
-  for (uint i = 0; i < m_parser.get_field_count(); i++) {
-    if (index_cover_bitmap[field_list[i]->field_index]) {
-      // We need to unpack secondary key
-      m_unpack_index = true;
-    } else if (!m_index_is_pk && pk_cover_bitmap[field_list[i]->field_index]) {
-      // We need to unpack primary key
-      m_unpack_pk = true;
-    } else {
-      // We need to unpack value (not just the key)
-      m_unpack_value = true;
-    }
+  if (!m_keyread_only && !m_index_is_pk) {
+    m_key_def->get_lookup_bitmap(m_table, &m_lookup_bitmap);
   }
+
+  m_converter->setup_field_decoders(m_table->read_set, m_index,
+                                    false /* keyread_only */);
 }
 
 bool INLINE_ATTR select_exec::run() {
@@ -1282,6 +1362,10 @@ bool INLINE_ATTR select_exec::run() {
     return true;
   }
 
+  if (m_select_limit == 0) {
+    return false;
+  }
+
   return run_query();
 }
 
@@ -1312,7 +1396,7 @@ bool inline select_exec::send_row() {
 }
 
 bool INLINE_ATTR select_exec::run_query() {
-  bool is_pk_point_query = m_index_is_pk && m_use_full_key;
+  bool is_pk_point_query = m_index_is_pk && m_is_point_query;
 
   // Initialize Rdb_transaction as needed
   txn_wrapper txn(m_thd);
@@ -1324,23 +1408,16 @@ bool INLINE_ATTR select_exec::run_query() {
 
   bool ret = false;
 
-  if (m_unpack_value) {
-    m_converter->setup_field_decoders(m_table->read_set);
-  }
-
   m_row_buf_prefix_end_pos = 0;
   m_row_buf.clear();
 
   if (is_pk_point_query) {
     ret = run_pk_point_query(&txn);
   } else {
-    // Either secondary key query or range query
-    if (m_unpack_pk || m_unpack_value) {
-      m_pk_tuple_buf.resize(m_pk_def->max_storage_fmt_length());
-    }
+    m_pk_tuple_buf.resize(m_pk_def->max_storage_fmt_length());
 
-    if (m_use_full_key && (m_index_info->flags & HA_NOSAME)) {
-      // The index is fully covered and unique
+    if (m_is_point_query) {
+      // The index is fully covered including both SK+PK
       ret = run_sk_point_query(&txn);
     } else {
       ret = run_range_query(&txn);
@@ -1369,7 +1446,7 @@ bool INLINE_ATTR select_exec::run_pk_point_query(txn_wrapper *txn) {
     std::vector<rocksdb::Status> statuses(size);
 
     for (auto &writer : m_key_index_tuples) {
-      key_slices.push_back(writer.to_key_slice());
+      key_slices.push_back(writer.get_key_slice());
     }
 
     // Just let linter shut up
@@ -1382,7 +1459,7 @@ bool INLINE_ATTR select_exec::run_pk_point_query(txn_wrapper *txn) {
                    value_slices.data(), statuses.data());
 
     for (size_t i = 0; i < size; ++i) {
-      if (handle_killed()) {
+      if (unlikely(handle_killed())) {
         return true;
       }
 
@@ -1414,7 +1491,7 @@ bool INLINE_ATTR select_exec::run_pk_point_query(txn_wrapper *txn) {
 
       value_slice.Reset();
 
-      rocksdb::Slice key_slice = writer.writer.to_slice();
+      rocksdb::Slice key_slice = writer.get_key_slice();
       rocksdb::Status s = txn->get(cf, key_slice, &value_slice);
       if (s.IsNotFound()) {
         continue;
@@ -1440,26 +1517,44 @@ bool INLINE_ATTR select_exec::run_pk_point_query(txn_wrapper *txn) {
   return false;
 }
 
+bool INLINE_ATTR select_exec::setup_iterator(txn_wrapper *txn,
+                                             const rocksdb::Slice &eq_slice) {
+  // Bounds needs to be least Rdb_key_def::INDEX_NUMBER_SIZE
+  size_t bound_len =
+      std::max<size_t>(eq_slice.size(), Rdb_key_def::INDEX_NUMBER_SIZE);
+  m_lower_bound_buf.reserve(bound_len);
+  m_upper_bound_buf.reserve(bound_len);
+  bool use_bloom = ha_rocksdb::check_bloom_and_set_bounds(
+      m_thd, *m_key_def, eq_slice, m_is_point_query, bound_len,
+      m_lower_bound_buf.data(), m_upper_bound_buf.data(), &m_lower_bound_slice,
+      &m_upper_bound_slice);
+  rocksdb::Iterator *it = txn->get_iterator(
+      m_key_def->get_cf(), use_bloom, m_lower_bound_slice, m_upper_bound_slice);
+  if (it == nullptr) {
+    return true;
+  }
+  m_scan_it.reset(it);
+  return false;
+}
+
 bool INLINE_ATTR select_exec::run_sk_point_query(txn_wrapper *txn) {
-  auto cf = m_key_def->get_cf();
   for (auto &writer : m_key_index_tuples) {
-    if (handle_killed()) {
+    if (unlikely(handle_killed())) {
       return true;
     }
 
-    rocksdb::Slice key_slice = writer.to_key_slice();
-    txn->set_seek_mode(use_bloom_filter(writer.to_eq_slice()));
-    m_scan_it.reset(txn->get_iterator(cf));
-    if (m_scan_it == nullptr) {
+    rocksdb::Slice key_slice = writer.get_key_slice();
+    if (unlikely(setup_iterator(txn, key_slice))) {
       return true;
     }
-
     m_scan_it->Seek(key_slice);
 
+    if (!is_valid_iterator(m_scan_it.get())) {
+      continue;
+    }
     auto rkey_slice = m_scan_it->key();
-    if (!is_valid_iterator(m_scan_it.get()) ||
-        memcmp(rkey_slice.data(), key_slice.data(),
-               std::min(rkey_slice.size(), key_slice.size())) != 0) {
+    if (rkey_slice.size() < key_slice.size() ||
+        memcmp(rkey_slice.data(), key_slice.data(), key_slice.size()) != 0) {
       continue;
     }
 
@@ -1485,28 +1580,24 @@ bool INLINE_ATTR select_exec::run_sk_point_query(txn_wrapper *txn) {
   This is the slow path as we need to unpack into record[0]
  */
 bool INLINE_ATTR select_exec::eval_cond() {
-  auto where_list = m_parser.get_cond_list();
-  for (uint i = 0; i < m_filter_count; ++i) {
-    // Let MySQL evaluate the conditional expression with item pointing to
-    // the field record. At least this is better than MySQL where index_key=A
-    // are always evaluated even though it is not necessary
-    if (where_list[m_filter_list[i]].cond_item->val_int() == 0) {
-      return false;
+  if (unlikely(m_filter_count > 0)) {
+    auto where_list = m_parser.get_cond_list();
+    for (uint i = 0; i < m_filter_count; ++i) {
+      // Let MySQL evaluate the conditional expression with item pointing to
+      // the field record. At least this is better than MySQL where index_key=A
+      // are always evaluated even though it is not necessary
+      if (where_list[m_filter_list[i]].cond_item->val_int() == 0) {
+        return false;
+      }
     }
   }
-
   return true;
 }
 
-bool INLINE_ATTR select_exec::unpack_for_pk(rocksdb::Slice rkey,
-                                            rocksdb::Slice rvalue) {
-  // Always unpack pk
-  // NOTE since we don't necessarily call setup_field_decoders we need to
-  // always call set_is_key_requested. This needs further refactoring
-  m_converter->set_is_key_requested(true);
-
-  int rc = m_converter->decode(m_key_def, m_table->record[0], &rkey, &rvalue,
-                               m_unpack_value);
+bool INLINE_ATTR select_exec::unpack_for_pk(const rocksdb::Slice &rkey,
+                                            const rocksdb::Slice &rvalue) {
+  // decode will handle key/value decoding for PK
+  int rc = m_converter->decode(m_key_def, m_table->record[0], &rkey, &rvalue);
   if (rc) {
     m_handler->print_error(rc, 0);
     return true;
@@ -1516,14 +1607,17 @@ bool INLINE_ATTR select_exec::unpack_for_pk(rocksdb::Slice rkey,
 }
 
 bool INLINE_ATTR select_exec::unpack_for_sk(txn_wrapper *txn,
-                                            rocksdb::Slice rkey,
-                                            rocksdb::Slice rvalue) {
+                                            const rocksdb::Slice &rkey,
+                                            const rocksdb::Slice &rvalue) {
+  bool covers_lookup =
+      m_keyread_only || m_key_def->covers_lookup(&rvalue, &m_lookup_bitmap);
+
   // SECONDARY KEY - there are a few cases to take care of:
   // 1. Secondary index covers the entire look up
-  // 2. Secondary index + primary index covers the look up
-  // 3. We need the value as well
+  // 2. Unpack everything using PK index + value
   int rc = 0;
-  if (m_unpack_index) {
+  if (covers_lookup) {
+    // SK covers the entire lookup
     rc =
         m_key_def->unpack_record(m_table, m_table->record[0], &rkey, &rvalue,
                                  m_converter->get_verify_row_debug_checksums());
@@ -1531,39 +1625,35 @@ bool INLINE_ATTR select_exec::unpack_for_sk(txn_wrapper *txn,
       m_handler->print_error(rc, 0);
       return true;
     }
+
+    ha_rocksdb::inc_covered_sk_lookup();
+    return false;
   }
 
-  if (m_unpack_pk || m_unpack_value) {
-    // We need the pk and/or value if the secondary key isn't enough
-    uint pk_tuple_size = 0;
+  // Unpack PK index + value
+  uint pk_tuple_size = 0;
+  pk_tuple_size = m_key_def->get_primary_key_tuple(m_table, *m_pk_def, &rkey,
+                                                   m_pk_tuple_buf.data());
+  if (pk_tuple_size == RDB_INVALID_KEY_LEN) {
+    m_handler->print_error(HA_ERR_ROCKSDB_CORRUPT_DATA, 0);
+    return true;
+  }
 
-    pk_tuple_size = m_key_def->get_primary_key_tuple(m_table, *m_pk_def, &rkey,
-                                                     m_pk_tuple_buf.data());
-    if (pk_tuple_size == RDB_INVALID_KEY_LEN) {
-      m_handler->print_error(HA_ERR_ROCKSDB_CORRUPT_DATA, 0);
-      return true;
-    }
+  rocksdb::Slice pk_key(reinterpret_cast<const char *>(m_pk_tuple_buf.data()),
+                        pk_tuple_size);
 
-    rocksdb::Slice pk_key(reinterpret_cast<const char *>(m_pk_tuple_buf.data()),
-                          pk_tuple_size);
+  m_pk_value.Reset();
+  rocksdb::Status s = txn->get(m_pk_def->get_cf(), pk_key, &m_pk_value);
+  if (!s.ok()) {
+    txn->report_error(s);
+    return true;
+  }
 
-    m_pk_value.Reset();
-    rocksdb::Status s = txn->get(m_pk_def->get_cf(), pk_key, &m_pk_value);
-    if (!s.ok()) {
-      txn->report_error(s);
-      return true;
-    }
-
-    if (m_unpack_pk || m_unpack_value) {
-      m_converter->set_is_key_requested(m_unpack_pk);
-      rc = m_converter->decode(m_pk_def, m_table->record[0], &pk_key,
-                               &m_pk_value, m_unpack_value);
-      if (rc) {
-        m_handler->print_error(rc, 0);
-        return true;
-      }
-    }
-  }  // m_unpack_value || m_unpack_value
+  rc = m_converter->decode(m_pk_def, m_table->record[0], &pk_key, &m_pk_value);
+  if (rc) {
+    m_handler->print_error(rc, 0);
+    return true;
+  }
 
   return false;
 }
@@ -1572,10 +1662,7 @@ int INLINE_ATTR select_exec::eval_and_send() {
   m_examined_rows++;
   if (eval_cond()) {
     m_row_count++;
-    if (m_row_count > m_select_limit) {
-      // no more items to consider
-      return -1;
-    } else if (m_row_count > m_offset_limit) {
+    if (m_row_count > m_offset_limit) {
       if (m_debug_row_delay > 0) {
         // Inject artificial delays for debugging/testing purposes
         my_sleep(m_debug_row_delay * 1000000);
@@ -1584,11 +1671,11 @@ int INLINE_ATTR select_exec::eval_and_send() {
         // failure
         return 1;
       }
+    }
 
-      if (m_row_count == m_select_limit) {
-        // we just sent the last one
-        return -1;
-      }
+    if (m_row_count >= m_select_limit) {
+      // we just sent the last one
+      return -1;
     }
   }
 
@@ -1597,79 +1684,156 @@ int INLINE_ATTR select_exec::eval_and_send() {
 }
 
 bool INLINE_ATTR select_exec::run_range_query(txn_wrapper *txn) {
+  // Determine seek direction - forward (Seek) or reverse (SeekForPrev)
   bool reverse_seek = m_key_def->m_is_reverse_cf ^ m_parser.is_order_desc();
 
   for (uint i = 0; i < m_key_index_tuples.size(); ++i) {
-    if (handle_killed()) {
+    if (unlikely(handle_killed())) {
       return true;
     }
 
-    rocksdb::Slice key_slice = m_key_index_tuples[i].to_key_slice();
-    uint eq_len = m_key_index_tuples[i].eq_len;
+    rocksdb::Slice start_key_slice =
+        m_key_index_tuples[i].get_start_key_slice();
+    rocksdb::Slice end_key_slice = m_key_index_tuples[i].get_end_key_slice();
+    rocksdb::Slice eq_slice = m_key_index_tuples[i].get_eq_slice();
+
+    // Range query need to support 4 combinations
+    // * forward cf, ascending order
+    // * forward cf, desending order
+    // * reverse cf, ascending order
+    // * reverse cf, descending order
+    // By look at the different combinations, one is able to infer
+    // * (Start, end) vs (end, start) is determined by order
+    // * End condition is determined by order
+    // * Seek direction is determined by reverse_seek
+    //
+    // Note we have already swapped start/end in case of descending order in
+    // scan_where, so we always start at start_key_slice and end at
+    // end_key_slice regardless. The more challenging / confusing part is to
+    // determine the exact (start, end) based on cf, order, and prefix
+    std::vector<uchar> initial_pos(
+        start_key_slice.data(),
+        start_key_slice.data() + start_key_slice.size());
+    rocksdb::Slice initial_pos_slice(
+        reinterpret_cast<char *>(initial_pos.data()), start_key_slice.size());
+    std::vector<uchar> end_pos(end_key_slice.data(),
+                               end_key_slice.data() + end_key_slice.size());
+    rocksdb::Slice end_pos_slice(reinterpret_cast<char *>(end_pos.data()),
+                                 end_key_slice.size());
 
     if (m_parser.is_order_desc()) {
-      // HA_READ_PREFIX_LAST (reverse cf) or HA_READ_PREFIX_LAST_OR_PREV
-      std::vector<uchar> initial_pos(key_slice.data(),
-                                     key_slice.data() + key_slice.size());
-
-      rocksdb::Slice initial_pos_slice(
-          reinterpret_cast<char *>(initial_pos.data()), key_slice.size());
-
-      uint bytes_changed =
-          m_key_def->successor(initial_pos.data(), key_slice.size());
-
-      // Account for the bytes changed by successor call in bloom filter
-      // calculation
-      txn->set_seek_mode(use_bloom_filter(
-          rocksdb::Slice(reinterpret_cast<char *>(initial_pos.data()),
-                         eq_len - bytes_changed)));
-
-      m_scan_it.reset(txn->get_iterator(m_key_def->get_cf()));
-      if (m_scan_it == nullptr) {
-        return true;
+      // Adjust start key if needed
+      // In reverse order, both forward cf (SeekForPrev) and reverse cf
+      // (Seek) have the same matrix:
+      // Full     A <= n --> start at n
+      // Full     A <  n --> start at pred(n)
+      // Partial  A <= n --> start at succ(n)
+      // Partial  A <  n --> start at n
+      if (m_start_inclusive && !m_start_full_key) {
+        // Partial A <= n
+        m_key_def->successor(initial_pos.data(), initial_pos.size());
+      } else if (!m_start_inclusive && m_start_full_key) {
+        // Full A <  n
+        m_key_def->predecessor(initial_pos.data(), initial_pos.size());
       }
 
-      rocksdb_smart_seek(!m_key_def->m_is_reverse_cf, m_scan_it.get(),
-                         initial_pos_slice);
-
-      if (!is_valid_iterator(m_scan_it.get())) {
-        continue;
-      }
-
-      const rocksdb::Slice rkey = m_scan_it->key();
-      if (m_use_full_key &&
-          m_key_def->cmp_full_keys(initial_pos_slice, rkey.data())) {
-        // We got a exact match
-        rocksdb_smart_next(reverse_seek, m_scan_it.get());
+      if (!end_key_slice.empty()) {
+        // Adjust end key if needed
+        // In reverse order, both forward cf (SeekForPrev) and reverse cf
+        // (Seek) have the same matrix:
+        // Full     A >= n --> stop at A < n
+        // Full     A >  n --> stop at A < succ(n)
+        // Partial  A >= n --> stop at A < n
+        // Partial  A >  n --> stop at A < succ(n)
+        if (!m_end_inclusive) {
+          DBUG_ASSERT(end_key_slice.size() > eq_slice.size());
+          m_key_def->successor(end_pos.data(), end_pos.size());
+        }
       }
     } else {
-      txn->set_seek_mode(use_bloom_filter(m_key_index_tuples[i].to_eq_slice()));
-      m_scan_it.reset(txn->get_iterator(m_key_def->get_cf()));
-      if (m_scan_it == nullptr) {
-        return true;
+      // Adjust start key if needed
+      // In forward order, both forward cf (SeekForPrev) and reverse cf
+      // (Seek) have the same matrix:
+      // Full     A >= n --> start at n
+      // Full     A >  n --> start at succ(n)
+      // Partial  A >= n --> start at n
+      // Partial  A >  n --> start at succ(n)
+      if (!m_start_inclusive) {
+        DBUG_ASSERT(start_key_slice.size() > eq_slice.size());
+        m_key_def->successor(initial_pos.data(), initial_pos.size());
       }
 
-      // HA_READ_KEY_OR_NEXT, aka, HA_READ_PREFIX_FIRST (I made this up)
-      rocksdb_smart_seek(m_key_def->m_is_reverse_cf, m_scan_it.get(),
-                         key_slice);
+      // Adjust end key if needed
+      // In forward order, both forward cf (SeekForPrev) and reverse cf
+      // (Seek) have the same matrix:
+      // Full     A <= n --> stop at A > n
+      // Full     A <  n --> stop at A > pred(n)
+      // Partial  A <= n --> stop at A > succ(n)
+      // Partial  A <  n --> stop at A > n
+      if (!end_key_slice.empty()) {
+        if (m_end_inclusive && !m_end_full_key) {
+          // Partial A <= n
+          m_key_def->successor(end_pos.data(), end_pos.size());
+        } else if (!m_end_inclusive && m_end_full_key) {
+          // Full A < n
+          m_key_def->predecessor(end_pos.data(), end_pos.size());
+        }
+      }
     }
+
+    // During seek, if we were to use bloom filter, we need to find the
+    // largest common prefix between start / eq (prefix). This is needed
+    // to ensure seek w/ bloom filter can correctly locate the key in
+    // a descending scan. For example, for such a query on SK where we
+    // need to issue SeekForPrev('a-c'):
+    // SELECT * WHERE A = a and B = b ORDER BY C DESC
+    // (a-b)          <--- eq / prefix
+    // a-b-a-PK
+    // ...
+    // a-b-z
+    // a-b-z-PK      <--- SeekForPrev('a-c') lands here
+    // (a-c)         <--- start slice
+    // So in order to seek correctly, prefix bloom filter can only use 'a'
+    // but not 'ac' since we want to actuall land on largest 'a-b'
+    rocksdb::Slice prefix_slice(initial_pos_slice.data(),
+                                initial_pos_slice.difference_offset(eq_slice));
+    if (unlikely(setup_iterator(txn, prefix_slice))) {
+      return true;
+    }
+
+    rocksdb_smart_seek(reverse_seek, m_scan_it.get(), initial_pos_slice);
 
     // Make sure the slice is alive as we'll point into the slice during
     // unpacking
     while (true) {
-      if (handle_killed()) {
+      if (unlikely(handle_killed())) {
         return true;
       }
 
-      if (!is_valid_iterator(m_scan_it.get())) {
+      if (unlikely(!is_valid_iterator(m_scan_it.get()))) {
         break;
       }
 
       const rocksdb::Slice rkey = m_scan_it->key();
-
-      if (rkey.size() < eq_len ||
-          memcmp(rkey.data(), key_slice.data(), eq_len) != 0) {
-        break;
+      if (end_key_slice.empty()) {
+        // No end - we stop when prefix no longer matches
+        if (!rkey.starts_with(eq_slice)) {
+          break;
+        }
+      } else {
+        // Range query (start, end)
+        // NOTE: To simplify the algorithm we always use non-inclusive
+        // check (> or <) and let the end slice handle the boundary
+        int diff = rkey.compare(end_pos_slice);
+        if (m_parser.is_order_desc()) {
+          if (diff < 0) {
+            break;
+          }
+        } else {
+          if (diff > 0) {
+            break;
+          }
+        }
       }
 
       // TODO: We could skip unpacking if m_filter_count=0 and we are
@@ -1677,20 +1841,20 @@ bool INLINE_ATTR select_exec::run_range_query(txn_wrapper *txn) {
       // for now
       const rocksdb::Slice rvalue = m_scan_it->value();
       if (m_index_is_pk) {
-        if (unpack_for_pk(rkey, rvalue)) {
+        if (unlikely(unpack_for_pk(rkey, rvalue))) {
           return true;
         }
       } else {
-        if (unpack_for_sk(txn, rkey, rvalue)) {
+        if (unlikely(unpack_for_sk(txn, rkey, rvalue))) {
           return true;
         }
       }
 
       int ret = eval_and_send();
-      if (ret > 0) {
+      if (unlikely(ret > 0)) {
         // failure
         return true;
-      } else if (ret < 0) {
+      } else if (unlikely(ret < 0)) {
         // no more items
         return false;
       }
@@ -1724,6 +1888,52 @@ bool inline is_bypass_on(st_select_lex *select_lex) {
 
 std::deque<REJECTED_ITEM> rejected_bypass_queries;
 std::mutex rejected_bypass_query_lock;
+bool handle_unsupported_bypass(THD *thd, const char *error_msg) {
+  rocksdb_select_bypass_rejected++;
+
+  if (should_log_rejected_select_bypass()) {
+    // Record the rejected query into the error log if rejected query history
+    // size equals zero
+    if (get_select_bypass_rejected_query_history_size() == 0) {
+      // NO_LINT_DEBUG
+      sql_print_information("[REJECTED_BYPASS_QUERY] Query='%s', Reason='%s'\n",
+                            thd->query(), error_msg);
+    } else {
+      // Otherwise, record the rejected query into information_schema
+      const std::lock_guard<std::mutex> lock(rejected_bypass_query_lock);
+
+      while (rejected_bypass_queries.size() >=
+             get_select_bypass_rejected_query_history_size()) {
+        rejected_bypass_queries.pop_back();
+      }
+
+      REJECTED_ITEM rejected_query_record;
+      rejected_query_record.rejected_bypass_query_timestamp =
+          thd->query_start_timeval_trunc(0);
+      // Normalize rejected query
+      String normalized_query_text;
+      compute_digest_text(&thd->m_digest->m_digest_storage,
+                          &normalized_query_text);
+      rejected_query_record.rejected_bypass_query =
+          normalized_query_text.c_ptr_safe();
+      rejected_query_record.error_msg = error_msg;
+
+      rejected_bypass_queries.push_front(rejected_query_record);
+    }
+  }
+
+  // During parse you can just let unsupported scenario fallback to MySQL
+  // implementation - but keep in mind it may regress performance
+  // Default is TRUE - let unsupported SELECT scenario just fail
+  if (should_fail_unsupported_select_bypass()) {
+    my_printf_error(ER_NOT_SUPPORTED_YET,
+                    "SELECT statement pattern not supported: %s", MYF(0),
+                    error_msg);
+    return true;
+  } else {
+    return false;
+  }
+}
 
 bool rocksdb_handle_single_table_select(THD *thd, SELECT_LEX *select_lex) {
   // Checks for hint and policy
@@ -1735,57 +1945,15 @@ bool rocksdb_handle_single_table_select(THD *thd, SELECT_LEX *select_lex) {
   // Parse the SELECT statement
   select_parser select_stmt(thd, select_lex);
   if (select_stmt.parse()) {
-    rocksdb_select_bypass_rejected++;
-
-    if (should_log_rejected_select_bypass()) {
-      // Record the rejected query into the error log if rejected query history
-      // size equals zero
-      if (get_select_bypass_rejected_query_history_size() == 0) {
-        // NO_LINT_DEBUG
-        sql_print_information(
-            "[REJECTED_BYPASS_QUERY] Query='%s', Reason='%s'\n", thd->query(),
-            select_stmt.get_error_msg());
-      } else {
-        // Otherwise, record the rejected query into information_schema
-        const std::lock_guard<std::mutex> lock(rejected_bypass_query_lock);
-
-        while (rejected_bypass_queries.size() >=
-               get_select_bypass_rejected_query_history_size()) {
-          rejected_bypass_queries.pop_back();
-        }
-
-        REJECTED_ITEM rejected_query_record;
-        rejected_query_record.rejected_bypass_query_timestamp =
-            thd->query_start_timeval_trunc(0);
-        // Normalize rejected query
-        String normalized_query_text;
-        compute_digest_text(&thd->m_digest->m_digest_storage,
-                            &normalized_query_text);
-        rejected_query_record.rejected_bypass_query =
-            normalized_query_text.c_ptr_safe();
-        rejected_query_record.error_msg = select_stmt.get_error_msg();
-
-        rejected_bypass_queries.push_front(rejected_query_record);
-      }
-    }
-
-    // During parse you can just let unsupported scenario fallback to MySQL
-    // implementation - but keep in mind it may regress performance
-    // Default is TRUE - let unsupported SELECT scenario just fail
-    if (should_fail_unsupported_select_bypass()) {
-      const char *error_msg = select_stmt.get_error_msg();
-      my_printf_error(ER_NOT_SUPPORTED_YET,
-                      "SELECT statement pattern not supported: %s", MYF(0),
-                      error_msg);
-      return true;
-    } else {
-      return false;
-    }
+    return handle_unsupported_bypass(thd, select_stmt.get_error_msg());
   }
 
   // Execute SELECT statement
   select_exec exec(select_stmt);
   if (exec.run()) {
+    if (exec.is_unsupported()) {
+      return handle_unsupported_bypass(thd, exec.get_error_msg());
+    }
     if (!thd->is_error()) {
       // The contract is that any booleaning return function should do its
       // best to report an error before return true, otherwise we'll report
@@ -1793,7 +1961,7 @@ bool rocksdb_handle_single_table_select(THD *thd, SELECT_LEX *select_lex) {
       // error code in all layers but that is not the case
       my_printf_error(ER_UNKNOWN_ERROR, "Unknown error", 0);
     }
-    if (should_log_rejected_select_bypass()) {
+    if (should_log_failed_select_bypass()) {
       // NO_LINT_DEBUG
       sql_print_information("[FAILED_BYPASS_QUERY] Query='%s', Reason='%s'\n",
                             thd->query(), thd->get_stmt_da()->message());

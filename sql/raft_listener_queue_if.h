@@ -26,6 +26,9 @@ enum class RaftListenerCallbackType
   GET_EXECUTED_GTIDS = 15,
   SET_BINLOG_DURABILITY = 16,
   RAFT_CONFIG_CHANGE = 17,
+  HANDLE_DUMP_THREADS = 18,
+  // Note: Please update CallbackTypeToString() below when adding/removing elems
+  // here
 };
 
 /* Callback argument, each type would just populate the fields needed for its
@@ -43,6 +46,7 @@ class RaftListenerCallbackArg
     std::pair<std::string, unsigned int> master_instance;
     std::string val_str;
     std::map<std::string, unsigned int> val_sys_var_uint;
+    std::pair<int64_t, int64_t> val_opid;
 };
 
 /* Result of the callback execution in the server. This will be set in the
@@ -117,4 +121,48 @@ class RaftListenerQueueIf {
   virtual int init() = 0;
 
   virtual void deinit() = 0;
+
+  static std::string CallbackTypeToString(RaftListenerCallbackType type) {
+    switch (type) {
+      case RaftListenerCallbackType::SET_READ_ONLY:
+        return "SET_READ_ONLY";
+      case RaftListenerCallbackType::TRIM_LOGGED_GTIDS:
+        return "TRIM_LOGGED_GTIDS";
+      case RaftListenerCallbackType::ROTATE_BINLOG:
+        return "ROTATE_BINLOG";
+      case RaftListenerCallbackType::ROTATE_RELAYLOG:
+        return "ROTATE_RELAYLOG";
+      case RaftListenerCallbackType::RAFT_LISTENER_THREADS_EXIT:
+        return "RAFT_LISTENER_THREADS_EXIT";
+      case RaftListenerCallbackType::RLI_RELAY_LOG_RESET:
+        return "RLI_RELAY_LOG_RESET";
+      case RaftListenerCallbackType::RESET_SLAVE:
+        return "RESET_SLAVE";
+      case RaftListenerCallbackType::BINLOG_CHANGE_TO_APPLY:
+        return "BINLOG_CHANGE_TO_APPLY";
+      case RaftListenerCallbackType::BINLOG_CHANGE_TO_BINLOG:
+        return "BINLOG_CHANGE_TO_BINLOG";
+      case RaftListenerCallbackType::STOP_SQL_THREAD:
+        return "STOP_SQL_THREAD";
+      case RaftListenerCallbackType::START_SQL_THREAD:
+        return "START_SQL_THREAD";
+      case RaftListenerCallbackType::STOP_IO_THREAD:
+        return "STOP_IO_THREAD";
+      case RaftListenerCallbackType::CHANGE_MASTER:
+        return "CHANGE_MASTER";
+      case RaftListenerCallbackType::GET_COMMITTED_GTIDS:
+        return "GET_COMMITTED_GTIDS";
+      case RaftListenerCallbackType::GET_EXECUTED_GTIDS:
+        return "GET_EXECUTED_GTIDS";
+      case RaftListenerCallbackType::SET_BINLOG_DURABILITY:
+        return "SET_BINLOG_DURABILITY";
+      case RaftListenerCallbackType::RAFT_CONFIG_CHANGE:
+        return "RAFT_CONFIG_CHANGE";
+      case RaftListenerCallbackType::HANDLE_DUMP_THREADS:
+        return "HANDLE_DUMP_THREADS";
+      default:
+        return {};
+    }
+    return {};
+  }
 };

@@ -74,6 +74,11 @@
 #include "rapidjson/writer.h"
 #endif
 #include <sstream>
+#include <list>
+#ifdef HAVE_REPLICATION
+#include "rpl_rli_pdb.h"                     // Slave_worker
+#include "rpl_slave_commit_order_manager.h"
+#endif
 
 #ifdef TARGET_OS_LINUX
 #include <sys/syscall.h>
@@ -93,7 +98,16 @@ char empty_c_string[1]= {0};    /* used for not defined db */
 LEX_STRING EMPTY_STR= { (char *) "", 0 };
 LEX_STRING NULL_STR=  { NULL, 0 };
 
+/* empty string */
+static const std::string emptyStr = "";
+
 const char * const THD::DEFAULT_WHERE= "field list";
+
+/*
+  When the thread is killed, we store the reason why it is killed in this buffer
+  so that clients can understand why their query fails
+*/
+constexpr size_t KILLED_REASON_MAX_LEN = 128;
 
 /****************************************************************************
 ** User variables
@@ -789,10 +803,16 @@ void thd_store_lsn(THD* thd, ulonglong lsn, int engine_type)
 
   @return Pointer to string
 */
-
 extern "C"
 char *thd_security_context(THD *thd, char *buffer, unsigned int length,
-                           unsigned int max_query_len)
+                           unsigned int max_query_len) {
+  return thd_security_context_internal(thd, buffer, length, max_query_len,
+                                       false /* show_query_digest */);
+}
+
+char *thd_security_context_internal(
+  THD *thd, char *buffer, unsigned int length, unsigned int max_query_len,
+  my_bool show_query_digest)
 {
   String str(buffer, length, &my_charset_latin1);
   Security_context *sctx= &thd->main_security_ctx;
@@ -857,12 +877,23 @@ char *thd_security_context(THD *thd, char *buffer, unsigned int length,
   {
     if (thd->query())
     {
-      if (max_query_len < 1)
-        len= thd->query_length();
-      else
-        len= min(thd->query_length(), max_query_len);
+      String digest_buffer;
+      const char *query_str;
+      const CHARSET_INFO *query_cs = NULL;
+      uint32 query_len;
+      if (show_query_digest) {
+        thd->get_query_digest(&digest_buffer, &query_str, &query_len,
+                              &query_cs);
+      } else {
+        query_str = thd->query();
+        query_len = thd->query_length();
+      }
+
+      if (max_query_len >= 1) {
+        query_len= min(query_len, max_query_len);
+      }
       str.append('\n');
-      str.append(thd->query(), len);
+      str.append(query_str, query_len);
     }
 
     mysql_mutex_unlock(&thd->LOCK_thd_data);
@@ -889,7 +920,6 @@ char *thd_security_context(THD *thd, char *buffer, unsigned int length,
   buffer[length]= '\0';
   return buffer;
 }
-
 
 /**
   Implementation of Drop_table_error_handler::handle_condition().
@@ -1021,6 +1051,7 @@ THD::THD(bool enable_plugins)
   query_start_used= query_start_usec_used= 0;
   count_cuted_fields= CHECK_FIELD_IGNORE;
   killed= NOT_KILLED;
+  killed_reason = NULL;
   col_access=0;
   is_slave_error= thread_specific_used= FALSE;
   my_hash_clear(&handler_tables_hash);
@@ -1546,12 +1577,19 @@ void THD::init(void)
   owned_gtid.sidno= 0;
   owned_gtid.gno= 0;
 
+  /* Auto created snapshot is released after stmt. If somehow it wasn't,
+     then any snapshot is released on connection close or change user so
+     reset the auto flag as well. */
+  m_created_auto_stats_snapshot = false;
+
   mt_key_clear(THD::SQL_ID);
   mt_key_clear(THD::CLIENT_ID);
   mt_key_clear(THD::PLAN_ID);
   mt_key_clear(THD::SQL_HASH);
   set_plan_capture(false);
   reset_stmt_stats();
+
+  reset_all_mt_table_filled();
 }
 
 
@@ -1615,6 +1653,16 @@ void THD::reset_stmt_stats()
   m_stmt_start_write_time_is_set = false;
 }
 
+/**
+  Reset the table-filled indicators before the next statement.
+ */
+void THD::reset_all_mt_table_filled()
+{
+  for (int i = 0; i < MT_TABLE_NAME_MAX; i++)
+  {
+    mt_table_filled[i] = false;
+  }
+}
 
 /*
   Do what's needed when one invokes change user
@@ -1917,6 +1965,10 @@ THD::~THD()
   {
     my_free(m_token_array);
   }
+  if (killed_reason != NULL)
+  {
+    my_free(killed_reason);
+  }
   DBUG_VOID_RETURN;
 }
 
@@ -1996,7 +2048,7 @@ void add_diff_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var,
   @note Do always call this while holding LOCK_thd_data.
 */
 
-void THD::awake(THD::killed_state state_to_set)
+void THD::awake(THD::killed_state state_to_set, const char *reason)
 {
   DBUG_ENTER("THD::awake");
   DBUG_PRINT("enter", ("this: %p current_thd: %p", this, current_thd));
@@ -2005,6 +2057,21 @@ void THD::awake(THD::killed_state state_to_set)
 
   /* Set the 'killed' flag of 'this', which is the target THD object. */
   killed= state_to_set;
+  if (reason) {
+    static constexpr int len = KILLED_REASON_MAX_LEN;
+    if (!killed_reason) {
+      killed_reason = (char *)my_malloc(len, MYF(0));
+    }
+    if (killed_reason) {
+      strncpy(killed_reason, reason, len - 1);
+      killed_reason[len - 1] = '\0';
+    }
+  } else {
+    if (killed_reason && killed_reason[0] != '\0') {
+      // no reason is given, let's clean up previous killed_reason
+      killed_reason[0] = '\0';
+    }
+  }
 
   if (state_to_set != THD::KILL_QUERY && state_to_set != THD::KILL_TIMEOUT)
   {
@@ -2222,12 +2289,14 @@ static void kill_one_srv_session(
   @param thd			Thread class
   @param id			Thread id
   @param only_kill_query        Should it kill the query or the connection
+  @param reason The reason why this is killed
 
   @note
     This is written such that we have a short lock on LOCK_thread_count
 */
 
-uint THD::kill_one_thread(my_thread_id id, bool only_kill_query)
+uint THD::kill_one_thread(my_thread_id id, bool only_kill_query,
+                          const char *reason)
 {
   uint error=ER_NO_SUCH_THREAD;
   DBUG_ENTER("kill_one_thread");
@@ -2297,7 +2366,8 @@ uint THD::kill_one_thread(my_thread_id id, bool only_kill_query)
         }
 #endif
 
-        other->awake(only_kill_query ? THD::KILL_QUERY : THD::KILL_CONNECTION);
+        other->awake(only_kill_query ? THD::KILL_QUERY : THD::KILL_CONNECTION,
+                     reason);
       }
       error= 0;
     }
@@ -4965,9 +5035,22 @@ static bool filter_wait_type(int wait_type) {
     return admission_control_wait_events & ADMISSION_CONTROL_THD_WAIT_NET_IO;
   case THD_WAIT_YIELD:
     return admission_control_wait_events & ADMISSION_CONTROL_THD_WAIT_YIELD;
+  case THD_WAIT_META_DATA_LOCK:
+    return admission_control_wait_events & ADMISSION_CONTROL_THD_WAIT_META_DATA_LOCK;
+  case THD_WAIT_COMMIT:
+    return admission_control_wait_events & ADMISSION_CONTROL_THD_WAIT_COMMIT;
   default:
     return false;
   }
+}
+
+/**
+  Some wait types cannot tolerate readmission timeout error.
+
+  @return true if wait type needs readmission when done, false otherwise.
+*/
+static bool readmit_wait_type(int wait_type) {
+  return wait_type != THD_WAIT_COMMIT;
 }
 
 /*
@@ -4993,13 +5076,30 @@ static bool filter_wait_type(int wait_type) {
 */
 extern "C" void thd_wait_begin(MYSQL_THD thd, int wait_type)
 {
-  if (thd && thd->is_in_ac && filter_wait_type(wait_type)) {
-    multi_tenancy_exit_query(thd);
-    // For explicit yields, we want to send the query to the back of the queue
-    // to allow for other queries to run. For other yields, it's likely we
-    // want to finish the query as soon as possible.
-    thd->readmission_mode = (wait_type == THD_WAIT_YIELD)
-      ? AC_REQUEST_QUERY_READMIT_LOPRI : AC_REQUEST_QUERY_READMIT_HIPRI;
+  if (thd) {
+    if (thd->is_in_ac) {
+      if (filter_wait_type(wait_type)) {
+        multi_tenancy_exit_query(thd);
+
+        if (!readmit_wait_type(wait_type)) {
+          thd->readmission_mode = AC_REQUEST_NONE;
+        } else {
+          // For explicit yields, we want to send the query to the back of the
+          // queue to allow for other queries to run. For other yields, it's
+          // likely we want to finish the query as soon as possible.
+          thd->readmission_mode = (wait_type == THD_WAIT_YIELD)
+            ? AC_REQUEST_QUERY_READMIT_LOPRI : AC_REQUEST_QUERY_READMIT_HIPRI;
+        }
+
+        // Assert that thd_wait_begin/thd_wait_end calls should match.
+        // In case they do not, reset the nesting level in release.
+        DBUG_ASSERT(thd->readmission_nest_level == 0);
+        thd->readmission_nest_level = 0;
+      }
+    } else if (thd->readmission_mode > AC_REQUEST_NONE) {
+      // Nested thd_wait_begin so need to skip thd_wait_end.
+      ++thd->readmission_nest_level;
+    }
   }
   MYSQL_CALLBACK(thread_scheduler, thd_wait_begin, (thd, wait_type));
 }
@@ -5014,12 +5114,17 @@ extern "C" void thd_wait_end(MYSQL_THD thd)
 {
   MYSQL_CALLBACK(thread_scheduler, thd_wait_end, (thd));
   if (thd && thd->readmission_mode > AC_REQUEST_NONE) {
-    if (++thd->readmission_count % 1000 == 0) {
-      thd->readmission_mode = AC_REQUEST_QUERY_READMIT_LOPRI;
-    }
+    if (thd->readmission_nest_level > 0) {
+      // Skip this nested thd_wait_end call.
+      --thd->readmission_nest_level;
+    } else {
+      if (++thd->readmission_count % 1000 == 0) {
+        thd->readmission_mode = AC_REQUEST_QUERY_READMIT_LOPRI;
+      }
 
-    multi_tenancy_admit_query(thd, thd->readmission_mode);
-    thd->readmission_mode = AC_REQUEST_NONE;
+      multi_tenancy_admit_query(thd, thd->readmission_mode);
+      thd->readmission_mode = AC_REQUEST_NONE;
+    }
   }
 }
 #else
@@ -6089,19 +6194,21 @@ void THD::serialize_client_attrs()
     std::vector<std::pair<String, String>> client_attrs;
     bool found_async_id = false;
 
-    // Populate caller, async_id
-    for (const auto& s : { "caller", "async_id" }) {
+    mysql_mutex_lock(&LOCK_global_sql_stats);
+    // Populate caller, origina_caller, async_id, etc
+    for(const std::string& name_iter : client_attribute_names) {
       bool found = false;
-      auto it = query_attrs_map.find(s);
+      auto it = query_attrs_map.find(name_iter);
 
       if (it != query_attrs_map.end()) {
         found = true;
-      } else if ((it = connection_attrs_map.find(s)) != connection_attrs_map.end()) {
+      } else if ((it = connection_attrs_map.find(name_iter))
+                 != connection_attrs_map.end()) {
         found = true;
       }
 
       if (found) {
-        if (strcmp(s, "async_id") == 0) {
+        if (name_iter == "async_id") {
           found_async_id = true;
         }
 
@@ -6111,6 +6218,7 @@ void THD::serialize_client_attrs()
                                          &my_charset_bin));
       }
     }
+    mysql_mutex_unlock(&LOCK_global_sql_stats);
 
     // Populate async id (inspired from find_async_tag)
     //
@@ -6429,10 +6537,11 @@ bool THD::dml_execution_cpu_limit_exceeded(ha_statistics* stats)
    * - write_control_level is set to 'OFF' or
    * - write_cpu_limit_milliseconds is set to 0 or
    * - write_time_check_batch is set to 0
+   * - sql_log_bin is set to 0
    */
   if (write_control_level == CONTROL_LEVEL_OFF ||
       write_cpu_limit_milliseconds == 0 ||
-      write_time_check_batch == 0)
+      write_time_check_batch == 0 || variables.sql_log_bin == 0)
     return false;
 
   /* if the variable 'write_control_level' is set to 'NOTE' or 'WARN'
@@ -6629,4 +6738,314 @@ ulong THD::get_query_or_connect_attr_value(
   }
 
   return default_value;
+}
+
+/**
+  Create SQL stats snapshot if sql_stats_auto_snapshot is enabled.
+*/
+void THD::auto_create_sql_stats_snapshot()
+{
+  if (!variables.sql_stats_snapshot &&
+      variables.sql_stats_auto_snapshot &&
+      !toggle_sql_stats_snapshot(this))
+  {
+    variables.sql_stats_snapshot = TRUE;
+    m_created_auto_stats_snapshot = true;
+  }
+}
+
+/**
+  Release auto created SQL stats snapshot.
+*/
+void THD::release_auto_created_sql_stats_snapshot()
+{
+  if (m_created_auto_stats_snapshot)
+  {
+    DBUG_ASSERT(variables.sql_stats_snapshot);
+
+    /* Release cannot fail. */
+    toggle_sql_stats_snapshot(this);
+    variables.sql_stats_snapshot = FALSE;
+    m_created_auto_stats_snapshot = false;
+  }
+}
+
+static const char missing_digest_msg[] =
+  "<digest_missing: sql_stats_control required>";
+
+/**
+  Get query digest
+*/
+void THD::get_query_digest(String *digest_buffer, const char **str,
+                           uint32 *length, const CHARSET_INFO **cs) {
+  if (m_digest != NULL) {
+    compute_digest_text(&m_digest->m_digest_storage, digest_buffer);
+  }
+
+  if (digest_buffer->is_empty() ||
+      (digest_buffer->length() == 1 &&
+       digest_buffer->ptr()[0] == 0)) {
+    /* We couldn't compute digest - we need sql_stats_control */
+    *str = missing_digest_msg;
+    *length = sizeof(missing_digest_msg) / sizeof(char) - 1;
+    *cs = &my_charset_utf8_bin;
+  } else {
+    *str = digest_buffer->c_ptr_safe();
+    *length = digest_buffer->length();
+    *cs = digest_buffer->charset();
+  }
+}
+
+/**
+  Get tables in the query. The tables are returned as a list of pairs
+  where the first value is the dbname and the second value is the table name.
+
+  @return List of pairs: dbname, table name
+ */
+std::list<std::pair<const char*, const char*> > THD::get_query_tables()
+{
+  std::list<std::pair<const char*, const char*>> uniq_tables;
+  std::list<std::string> uniq_tables_str;
+
+  /* iterate through the list of tables */
+  for (const TABLE_LIST* table = lex->query_tables; table != nullptr;
+       table = table->next_global) {
+    if (table->is_view_or_derived()) {
+      continue;
+    }
+
+    const char* dbname = table->get_db_name();
+    const char* tname = table->get_table_name();
+    std::string full_tname = dbname;
+    full_tname.append(".");
+    full_tname.append(tname);
+
+    /* skip duplicate entries */
+    if (find(uniq_tables_str.begin(), uniq_tables_str.end(), full_tname) !=
+        uniq_tables_str.end()) {
+      continue;
+    }
+
+    uniq_tables_str.emplace_back(full_tname);
+    uniq_tables.emplace_back(dbname, tname);
+  }
+  return uniq_tables;
+}
+
+/**
+  Get tables in the query. The tables are returned as a list of pairs
+  where the first value is the dbname and the second value is the table name.
+
+  @param  thd  Thread pointer
+
+  @return List of pairs: dbname, table name
+ */
+std::list<std::pair<const char*, const char*> > thd_get_query_tables(
+    THD *thd) {
+  return thd->get_query_tables();
+}
+
+/**
+  Get the value of the query attribute
+
+  @param qattr_key Name of the query attribute
+
+  @return Value of the query attribute 'qattr_key'
+*/
+const std::string &THD::get_query_attr(const std::string &qattr_key) {
+  /* find the key in the query attributes */
+  auto it = query_attrs_map.find(qattr_key);
+  if (it != query_attrs_map.end()) {
+    return it->second;
+  }
+
+  /* return empty result */
+  return emptyStr;
+}
+
+/**
+  Get the value of the connection attribute
+
+  @param cattr_key Name of the connection attribute
+
+  @return Value of the query attribute 'cattr_key'
+*/
+const std::string &THD::get_connection_attr(const std::string &cattr_key) {
+  /* find the key in the connection attributes */
+  auto it = connection_attrs_map.find(cattr_key);
+  if (it != connection_attrs_map.end()) {
+    return it->second;
+  }
+
+  /* return empty result */
+  return emptyStr;
+}
+
+/**
+  Get the value of the query attribute
+
+  @param thd       The MySQL internal thread pointer
+  @param qattr_key Name of the query attribute
+
+  @return Value of the query attribute 'qattr_key'
+*/
+const std::string &thd_get_query_attr(THD *thd, const std::string &qattr_key) {
+  return thd->get_query_attr(qattr_key);
+}
+
+/**
+  Get the value of the connection attribute
+
+  @param thd       The MySQL internal thread pointer
+  @param cattr_key Name of the connection attribute
+
+  @return Value of the query attribute 'cattr_key'
+*/
+const std::string &thd_get_connection_attr(THD *thd,
+                                           const std::string &cattr_key) {
+  return thd->get_connection_attr(cattr_key);
+}
+
+/**
+  Get the query SQL ID
+
+  @param thd       The MySQL internal thread pointer
+
+  @return the SQL ID of the query
+*/
+const std::string thd_get_sql_id(THD *thd) {
+  char sql_id_string[MD5_BUFF_LENGTH+1];
+
+  if (thd->mt_key_is_set(THD::SQL_ID)) {
+    array_to_hex(sql_id_string, thd->mt_key_value(THD::SQL_ID).data(),
+                 MD5_HASH_SIZE),
+    sql_id_string[MD5_BUFF_LENGTH] = '\0';
+  } else {
+    sql_id_string[0] = '\0';
+  }
+  return std::string(sql_id_string);
+}
+
+void thd_add_response_attr(
+    THD *thd, const std::string &rattr_key, const std::string &rattr_val)
+{
+    auto tracker= thd->session_tracker.get_tracker(SESSION_RESP_ATTR_TRACKER);
+
+    if (tracker->is_enabled())
+    {
+      LEX_CSTRING key= { rattr_key.c_str(), rattr_key.length() };
+      LEX_CSTRING value= { rattr_val.c_str(), rattr_val.length() };
+      tracker->mark_as_changed(thd, &key, &value);
+    }
+}
+
+#ifndef EMBEDDED_LIBRARY
+/**
+   Interface for Engine to report row lock conflict.
+   The caller should guarantee thd_wait_for does not be freed, when it is
+   called.
+*/
+extern "C"
+void thd_report_row_lock_wait(THD* self, THD *wait_for)
+{
+  DBUG_ENTER("thd_report_row_lock_wait");
+
+  DBUG_EXECUTE_IF("report_row_lock_wait", {
+     const char act[]= "now signal signal.reached wait_for signal.done";
+     DBUG_ASSERT(opt_debug_sync_timeout > 0);
+     DBUG_ASSERT(!debug_sync_set_action(self, STRING_WITH_LEN(act)));
+  };);
+
+  if (unlikely(self != NULL && wait_for != NULL &&
+      is_mts_worker(self) && is_mts_worker(wait_for)))
+    commit_order_manager_check_deadlock(self, wait_for);
+
+  DBUG_VOID_RETURN;
+}
+#else
+extern "C"
+void thd_report_row_lock_wait(THD* self, THD *thd_wait_for)
+{
+  return;
+}
+#endif
+
+/**
+  Call thd_wait_begin to mark the wait start.
+*/
+Thd_wait_scope::Thd_wait_scope(THD *thd, int wait_type) : m_thd(thd) {
+  thd_wait_begin(m_thd, wait_type);
+}
+
+/**
+  Call thd_wait_end to mark the wait end.
+*/
+Thd_wait_scope::~Thd_wait_scope() {
+  thd_wait_end(m_thd);
+}
+
+bool THD::set_dscp_on_socket() {
+  int dscp_val = variables.dscp_on_socket;
+
+  if (dscp_val < 0 || dscp_val >= 64) {
+    // NO_LINT_DEBUG
+    sql_print_warning("Invalid DSCP_QOS value in global var: %d",
+                        dscp_val);
+    return false;
+  }
+
+  if (dscp_val == 0) {
+    // Default unset value
+    return true;
+  }
+
+  const NET* net = get_net();
+
+  int tos= dscp_val << 2;
+
+  // figure out what domain is the socket in
+  uint16_t test_family;
+  socklen_t len= sizeof(test_family);
+  int res= mysql_socket_getsockopt(net->vio->mysql_socket, SOL_SOCKET,
+      SO_DOMAIN, (void*)&test_family, &len);
+
+  // Lets fail, if we can't determine IPV6 vs IPV4
+  if (res != 0) {
+    // NO_LINT_DEBUG
+    sql_print_warning("Failed to get socket domain "
+        "while adjusting DSCP_QOS (error: %s)",
+        strerror(errno));
+    return false;
+  }
+
+#ifdef HAVE_IPV6
+  if (test_family == AF_INET6) {
+    res= mysql_socket_setsockopt(net->vio->mysql_socket, IPPROTO_IPV6,
+        IPV6_TCLASS, &tos, sizeof(tos));
+  }
+  else
+#endif
+  if (test_family == AF_INET) {
+    res= mysql_socket_setsockopt(net->vio->mysql_socket, IPPROTO_IP,
+        IP_TOS, &tos, sizeof(tos));
+  } else if (test_family == PF_LOCAL) {
+    // NO_LINT_DEBUG
+    sql_print_information("Set socket TOS/TCLASS when access"
+        "from local to host. Ignore setting");
+    return true;
+  } else {
+    // NO_LINT_DEBUG
+    sql_print_warning("Failed to get socket family %d", test_family);
+    return false;
+  }
+
+  if (res != 0) {
+    // NO_LINT_DEBUG
+    sql_print_warning("Failed to set TOS/TCLASS "
+        "with (error: %s) DSCP: %d.",
+        strerror(errno), tos);
+    return false;
+  }
+
+  return true;
 }

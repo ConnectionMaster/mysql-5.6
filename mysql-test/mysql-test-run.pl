@@ -108,6 +108,7 @@ require "lib/mtr_io.pl";
 require "lib/mtr_gcov.pl";
 require "lib/mtr_gprof.pl";
 require "lib/mtr_misc.pl";
+require "lib/mtr_coverage.pl";
 
 $SIG{INT}= sub { mtr_error("Got ^C signal"); };
 
@@ -343,6 +344,14 @@ our %mysqld_variables;
 my $source_dist= 0;
 my $new_test_option = 0; # is '--new-tests' option specified
 
+my $full_command = ""; # full test coverage command. Used for coverage logging.
+my $coverage_on        = 0; # is coverage mode specified?
+my $coverage_scope     = "--coverage-scope=full"; # default coverage option
+my $coverage_src_path  = ""; # directory path for coverage source files
+my $coverage_llvm_path = ""; # directory path for llvm coverage binaries
+my $coverage_format    = "--coverage-format=text"; # default coverage format
+my $coverage_src_filter = ""; # default coverage src filter
+
 my $opt_max_save_core= env_or_val(MTR_MAX_SAVE_CORE => 5);
 my $opt_max_save_datadir= env_or_val(MTR_MAX_SAVE_DATADIR => 20);
 my $opt_max_test_fail= env_or_val(MTR_MAX_TEST_FAIL => 10);
@@ -358,6 +367,9 @@ main();
 sub main {
   # Default, verbosity on
   report_option('verbose', 0);
+
+  # Store the full mysqltest command. Used for coverage logging.
+  $full_command = $0." ".join(" ", @ARGV);
 
   # This is needed for test log evaluation in "gen-build-status-page"
   # in all cases where the calling tool does not log the commands
@@ -380,6 +392,13 @@ sub main {
 
   if ( $opt_gcov ) {
     gcov_prepare($basedir);
+  }
+
+  # Prepare to collect code coverage information
+  if ($coverage_on) {
+    coverage_prepare($bindir, $basedir, $coverage_scope, $coverage_src_path,
+                     $coverage_llvm_path, $coverage_format,
+                     $coverage_src_filter);
   }
 
   if (!$opt_suites) {
@@ -597,6 +616,17 @@ sub main {
   if ( $opt_gcov ) {
     gcov_collect($bindir, $opt_gcov_exe,
 		 $opt_gcov_msg, $opt_gcov_err);
+  }
+
+  # collect code coverage information
+  if ($coverage_on) {
+    # if directory for coverage source files is not specified then use $basedir
+    if (length($coverage_src_path) == 0) {
+      $coverage_src_path = $basedir;
+    }
+    coverage_collect($bindir, $basedir, find_mysqld($basedir), $coverage_scope,
+                     $coverage_src_path, $coverage_llvm_path,
+                     $coverage_format, $coverage_src_filter, $full_command);
   }
 
   if ($ctest_report) {
@@ -1419,6 +1449,61 @@ sub command_line_setup {
       # that the lone '--' separating options from arguments survives,
       # simply ignore it.
     }
+    elsif ( $arg eq "--coverage")
+    {
+      # --coverage is specified
+      $coverage_on = 1;
+    }
+    elsif ( $arg =~ /^--coverage-scope=/) # --coverage-scope=<>
+    {
+      # coverage option can be specified only with '--coverage' option
+      if (!$coverage_on) {
+        print "**** ERROR **** ",
+              "Option $arg is specified without --coverage\n";
+        exit(1);
+      }
+      $coverage_scope = $arg;
+    }
+    elsif ( $arg =~ /^--coverage-src-path=/)
+    {
+      # coverage source directory
+      if (!$coverage_on) {
+        print "**** ERROR **** ",
+              "Option $arg is specified without --coverage\n";
+        exit(1);
+      }
+      $coverage_src_path = $arg;
+    }
+    elsif ( $arg =~ /^--coverage-llvm-path=/)
+    {
+      # coverage source directory
+      if (!$coverage_on) {
+        print "**** ERROR **** ",
+              "Option $arg is specified without --coverage\n";
+        exit(1);
+      }
+      $coverage_llvm_path = $arg;
+    }
+    elsif ( $arg =~ /^--coverage-format=/)
+    {
+      # coverage format
+      if (!$coverage_on) {
+        print "**** ERROR **** ",
+              "Option $arg is specified without --coverage\n";
+        exit(1);
+      }
+      $coverage_format = $arg;
+    }
+    elsif ( $arg =~ /^--coverage-src-filter=/)
+    {
+      # coverage src filter
+      if (!$coverage_on) {
+        print "**** ERROR **** ",
+              "Option $arg is specified without --coverage\n";
+        exit(1);
+      }
+      $coverage_src_filter .= " $arg";
+    }
     elsif ( $arg eq "--new-tests")
     {
       # Run tests that are modified from the last commit
@@ -1509,6 +1594,12 @@ sub command_line_setup {
   if (IS_WINDOWS and defined $opt_mem) {
     mtr_report("--mem not supported on Windows, ignored");
     $opt_mem= undef;
+  }
+  # Disable '--mem' option in coverage mode
+  if ($coverage_on and defined $opt_mem) {
+    mtr_report("Turning off '--mem' option since it is not supported " .
+               "in code coverage mode.");
+    $opt_mem = undef;
   }
 
   if ($opt_port_base ne "auto")
@@ -5140,6 +5231,19 @@ sub clean_datadir {
     my $mysqld_dir= dirname($mysqld->value('datadir'));
     if (-d $mysqld_dir ) {
       mtr_verbose(" - removing '$mysqld_dir'");
+    # if coverage mode is enabled then copy the coverage profile files
+    # generated before they are purged
+      if ($coverage_on) {
+        my $cov_dir = "$bindir/coverage_files/".time();
+        # create the directory to move the files
+        mkpath("$cov_dir");
+        my @proffiles = `find $mysqld_dir/data -name \"code*.profraw\"`;
+        for my $pfile (@proffiles) {
+          chomp($pfile);
+          my @pfile_parts = split("/", $pfile);
+          rename($pfile, $cov_dir."/".$pfile_parts[$#pfile_parts]);
+        }
+      }
       rmtree($mysqld_dir);
     }
   }
@@ -7019,4 +7123,3 @@ sub list_options ($) {
 
   exit(1);
 }
-

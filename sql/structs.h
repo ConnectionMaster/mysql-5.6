@@ -30,6 +30,7 @@
 #include "atomic_stat.h"
 #include "hash.h"
 #include "sql_digest.h"
+#include <deque>
 #include <unordered_map>
 #include "sql_error.h"
 
@@ -419,13 +420,6 @@ typedef struct st_index_stats {
   my_io_perf_atomic_t io_perf_read;       /* Read IO performance counters */
 } INDEX_STATS;
 
-/*
- * Maximum number of indexes for which stats are collected.
- * Tables that have more use st_table_stats::indexes[MAX_INDEX_STATS-1]
- * for the extra indexes.
- */
-#define MAX_INDEX_STATS 10
-
 typedef struct st_shared_table_stats
 {
   uint32_t db_id;
@@ -459,8 +453,8 @@ typedef struct st_user_table_stats {
 typedef struct st_table_stats {
   SHARED_TABLE_STATS shared_stats;
 
-  INDEX_STATS indexes[MAX_INDEX_STATS];
-  uint num_indexes;         /* min(#indexes on table , MAX_INDEX_STATS) */
+  // Using a deque instead of a vector to avoid reallocation.
+  std::deque<INDEX_STATS>* indexes;
 
   atomic_stat<ulonglong> last_admin;   /* last admin use, seconds since epoch */
   atomic_stat<ulonglong> last_non_admin;   /* last non admin use, seconds ... */
@@ -490,7 +484,6 @@ typedef struct st_table_stats {
   bool should_update; /* Set for partitioned tables so later partitions will
                          increment the perf stats. Clear after collecting
                          table stats. */
-
 } TABLE_STATS;
 
 typedef struct st_db_stats {
@@ -592,13 +585,9 @@ typedef struct st_sql_stats {
 /* SQL text - stores the normalized text, type and Id for every SQL statement*/
 typedef struct st_sql_text {
   enum_sql_command sql_type;
-  size_t sql_text_length;
-  /*
-    We use sql_digest_storage but it contains fields that we don't need, that
-    we can remove if memory is a concern.
-  */
-  struct sql_digest_storage digest_storage;
-  unsigned char *token_array_storage;
+  size_t sql_text_length;  /* Stores length of the full normalized sql text. */
+  char *sql_text;          /* Array to store the normalized text */
+  size_t sql_text_arr_len; /* Stores the array length */
 } SQL_TEXT;
 
 /* SQL Finding - stores information about one SQL finding */
@@ -638,6 +627,7 @@ enum enum_wtr_mode
 struct WRITE_THROTTLING_RULE {
   time_t create_time;         /* creation time */
   enum_wtr_mode mode;                  /* Auto or manual */
+  uint throttle_rate;       /* Rate between [0, 100] with which this entity is throttled */
 };
 
 /* WRITE_THROTTLING_LOG - Stores metadata for an event when a write query was throttled */
@@ -656,11 +646,11 @@ struct WRITE_MONITORED_ENTITY {
     name = "";
     dimension = WTR_DIM_UNKNOWN;
     hits = 0;
-  } 
+  }
 
   WRITE_MONITORED_ENTITY() {
     reset();
-  }          
+  }
 };
 
 /*

@@ -7,14 +7,15 @@ grant all on test_db to test_user@localhost;
 create user super_user@localhost;
 grant all on *.* to super_user@localhost with grant option;
 
-let $ac_entities_query=select * from information_schema.admission_control_entities where schema_name like 'test%';
+let $ac_entities_query=select * from information_schema.admission_control_entities where schema_name like 'test%' order by schema_name;
 
 let $start_rejected_connections = query_get_value(show global status like "Database_admission_control_rejected_connections", Value, 1);
 
 SET @start_value = @@global.max_db_connections;
 SET @@global.max_db_connections = 10;
 SELECT @@global.max_db_connections;
-eval $ac_entities_query and connections <> 0;
+# Ideally, we'd be able to avoid repeating most the query in ac_entities_query.
+select * from information_schema.admission_control_entities where schema_name like 'test%' and connections <> 0 order by schema_name;
 
 enable_connect_log;
 connection default;

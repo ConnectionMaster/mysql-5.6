@@ -28,6 +28,7 @@ extern ulong rpl_read_size;
 extern char *histogram_step_size_binlog_fsync;
 extern int opt_histogram_step_size_binlog_group_commit;
 extern latency_histogram histogram_binlog_fsync;
+extern latency_histogram histogram_raft_trx_wait;
 extern counter_histogram histogram_binlog_group_commit;
 extern Slow_log_throttle log_throttle_sbr_unsafe_query;
 class Relay_log_info;
@@ -370,6 +371,12 @@ class HybridLogicalClock {
   bool wait_for_hlc_applied(THD *thd, TABLE_LIST *all_tables);
 
   /**
+   * Check that lower HLC bound requirements are satisfied for
+   * insert/update/delete queries.
+   */
+  bool check_hlc_bound(THD *thd);
+
+  /**
    * Verify if the given HLC value is 'valid', by which it isn't 0 or intmax
    *
    * @param [in] The HLC value to validate
@@ -441,6 +448,7 @@ class HybridLogicalClock {
 
 class MYSQL_BIN_LOG: public TC_LOG, private MYSQL_LOG
 {
+  friend class Dump_log;
 public:
   enum enum_read_gtids_from_binlog_status
   { GOT_GTIDS, GOT_PREVIOUS_GTIDS, NO_GTIDS, ERROR, TRUNCATED };
@@ -540,7 +548,7 @@ public:
   my_atomic_rwlock_t m_prep_xids_lock;
   mysql_cond_t m_prep_xids_cond;
   volatile int32 m_prep_xids;
-  volatile my_off_t binlog_end_pos;
+  my_off_t binlog_end_pos;
   // binlog_file_name is updated under LOCK_binlog_end_pos mutex
   // to match the latest log_file_name contents. This variable is used
   // in the execution of commands SHOW MASTER STATUS / SHOW BINARY LOGS
@@ -693,7 +701,7 @@ public:
     the very first Relay-Log file. In the following the value may change
     with each received master's FD_m.
     Besides to be used in verification events that IO thread receives
-    (except the 1st fake Rotate, see @c Master_info:: checksum_alg_before_fd), 
+    (except the 1st fake Rotate, see @c Master_info:: checksum_alg_before_fd),
     the value specifies if/how to compute checksum for slave's local events
     and the first fake Rotate (R_f^1) coming from the master.
     R_f^1 needs logging checksum-compatibly with the RL's heading FD_s.
@@ -830,6 +838,24 @@ public:
                       bool need_lock, uint64_t *max_prev_hlc= NULL,
                       bool startup= false);
 
+  /**
+   * This function is used by binlog_change_to_apply to update
+   * the previous gtid set map, since we don't call init_gtid_sets
+   * which would have initialized it from disk
+   */
+  bool init_prev_gtid_sets_map();
+
+  void get_lost_gtids(Gtid_set *gtids)
+  {
+    gtids->clear();
+    mysql_mutex_lock(&LOCK_index);
+    auto it = previous_gtid_set_map.begin();
+    if (it != previous_gtid_set_map.end() && !it->second.empty())
+      gtids->add_gtid_encoding(
+          (const uchar*)it->second.c_str(), it->second.length());
+    mysql_mutex_unlock(&LOCK_index);
+  }
+
   enum_read_gtids_from_binlog_status
   read_gtids_from_binlog(const char *filename, Gtid_set *all_gtids,
                          Gtid_set *prev_gtids, Gtid *first_gtid,
@@ -877,6 +903,8 @@ public:
   bool wait_for_hlc_applied(THD *thd, TABLE_LIST *all_tables) {
     return hlc.wait_for_hlc_applied(thd, all_tables);
   }
+
+  bool check_hlc_bound(THD *thd) { return hlc.check_hlc_bound(thd); }
 
   /*
    * @param raft_rotate_info
@@ -932,6 +960,7 @@ public:
   int recover(IO_CACHE *log, Format_description_log_event *fdle,
               my_off_t *valid_pos, const std::string& cur_binlog_file);
   int recover(IO_CACHE *log, Format_description_log_event *fdle);
+  int recover_raft_log();
   int set_valid_pos(
       my_off_t* valid_pos,
       const std::string& cur_binlog_file,
@@ -956,7 +985,7 @@ public:
   void harvest_bytes_written(Relay_log_info *rli, bool need_log_space_lock);
   void set_max_size(ulong max_size_arg);
   void signal_update();
-  void update_binlog_end_pos();
+  void update_binlog_end_pos(bool need_lock= true);
   int wait_for_update_relay_log(THD* thd, const struct timespec * timeout);
   int  wait_for_update_bin_log(THD* thd, const struct timespec * timeout);
 public:
@@ -1001,7 +1030,8 @@ public:
                    bool null_created,
                    bool need_lock_index, bool need_sid_lock,
                    Format_description_log_event *extra_description_event,
-                   RaftRotateInfo *raft_rotate_info= nullptr);
+                   RaftRotateInfo *raft_rotate_info= nullptr,
+                   bool need_end_log_pos_lock= true);
 
   /**
     Open an existing binlog/relaylog file
@@ -1012,7 +1042,8 @@ public:
   */
   bool open_existing_binlog(const char *log_name,
                             enum cache_type io_cache_type_arg,
-                            ulong max_size_arg);
+                            ulong max_size_arg,
+                            bool need_end_log_pos_lock= true);
 
   bool open_index_file(const char *index_file_name_arg,
                        const char *log_name, bool need_lock_index);
@@ -1260,6 +1291,133 @@ extern my_bool opt_process_can_disable_bin_log;
 
 extern MYSQL_PLUGIN_IMPORT MYSQL_BIN_LOG mysql_bin_log;
 
+/**
+ * Encapsulation over binlog or relay log for dumping raft logs during
+ * COM_BINLOG_DUMP and COM_BINLOG_DUMP_GTID (see @mysql_binlog_send)
+ */
+class Dump_log
+{
+public:
+
+  // RAII class to handle locking for Dump_log
+  class Locker
+  {
+  public:
+    Locker(Dump_log* dump_log)
+    {
+      dump_log_= dump_log;
+      should_lock_= dump_log_->lock();
+    }
+
+    ~Locker()
+    {
+      if (should_lock_)
+        dump_log_->unlock(should_lock_);
+    }
+  private:
+    bool should_lock_= false;
+    Dump_log* dump_log_= nullptr;
+  };
+
+  Dump_log();
+
+  void switch_log(bool relay_log, bool should_lock= true);
+
+  MYSQL_BIN_LOG* get_log(bool should_lock= true)
+  {
+    bool is_locked= false;
+    if (should_lock) is_locked= lock();
+    auto ret= log_;
+    if (should_lock) unlock(is_locked);
+    return ret;
+  }
+
+  bool is_relay_log()
+  {
+    Locker lock(this);
+    return !(log_ == &mysql_bin_log);
+  }
+
+  bool is_open()
+  {
+    Locker lock(this);
+    return log_->is_open();
+  }
+
+  bool is_active(const char* log_file_name)
+  {
+    Locker lock(this);
+    return log_->is_active(log_file_name);
+  }
+
+  my_off_t get_binlog_end_pos_without_lock()
+  {
+    Locker lock(this);
+    return log_->get_binlog_end_pos_without_lock();
+  }
+
+  void make_log_name(char* buf, const char* log_ident)
+  {
+    Locker lock(this);
+    log_->make_log_name(buf, log_ident);
+  }
+
+  bool find_first_log_not_in_gtid_set(char *binlog_file_name,
+                                      const Gtid_set *gtid_set,
+                                      Gtid *first_gtid,
+                                      const char **errmsg)
+  {
+    Locker lock(this);
+    return log_->find_first_log_not_in_gtid_set(binlog_file_name, gtid_set,
+                                                first_gtid, errmsg);
+  }
+
+  int find_log_pos(LOG_INFO* linfo,
+                   const char* log_name,
+                   bool need_lock_index)
+  {
+    Locker lock(this);
+    return log_->find_log_pos(linfo, log_name, need_lock_index);
+  }
+
+  int find_next_log(LOG_INFO* linfo,
+                    bool need_lock_index)
+  {
+    Locker lock(this);
+    return log_->find_next_log(linfo, need_lock_index);
+  }
+
+  void get_lost_gtids(Gtid_set *gtids)
+  {
+    Locker lock(this);
+    log_->get_lost_gtids(gtids);
+  }
+
+  // Avoid using this and try to use Dump_log::Locker class instead
+  bool lock()
+  {
+    // NOTE: we lock only when we're in raft mode. That's why we're returning a
+    // bool to indicate wheather we locked or not. We pass this bool to unlock
+    // method to unlock only then the mutex was actually locked.
+    const bool should_lock= enable_raft_plugin;
+    if (should_lock)
+      log_mutex_.lock();
+    return should_lock;
+  }
+
+  // Avoid using this and try to use Dump_log::Locker class instead
+  void unlock(bool is_locked)
+  {
+    if (is_locked)
+      log_mutex_.unlock();
+  }
+
+private:
+  MYSQL_BIN_LOG *log_;
+  std::mutex log_mutex_;
+};
+extern MYSQL_PLUGIN_IMPORT Dump_log dump_log;
+
 bool is_binlog_cache_empty(const THD* thd);
 bool trans_has_updated_trans_table(const THD* thd);
 bool stmt_has_updated_trans_table(Ha_trx_info* ha_list);
@@ -1281,7 +1439,7 @@ bool purge_master_logs_before_date(THD* thd, time_t purge_time);
 bool purge_raft_logs(THD* thd, const char* to_log);
 bool purge_raft_logs_before_date(THD* thd, time_t purge_time);
 bool update_relay_log_cordinates(Relay_log_info* rli);
-bool show_raft_logs(THD* thd);
+bool show_raft_logs(THD* thd, bool with_gtid = false);
 bool show_raft_status(THD* thd);
 bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log);
 bool show_binlog_cache(THD *thd, MYSQL_BIN_LOG *binary_log);
@@ -1305,7 +1463,7 @@ extern bool opt_gtid_precommit;
   opt_bin_logname or opt_relay_logname.
 
   @param from         The log name we want to make into an absolute path.
-  @param to           The buffer where to put the results of the 
+  @param to           The buffer where to put the results of the
                       normalization.
   @param is_relay_log Switch that makes is used inside to choose which
                       option (opt_bin_logname or opt_relay_logname) to
@@ -1328,13 +1486,13 @@ inline bool normalize_binlog_name(char *to, const char *from, bool is_relay_log)
   if (opt_name && opt_name[0] && from && !test_if_hard_path(from))
   {
     // take the path from opt_name
-    // take the filename from from 
+    // take the filename from from
     char log_dirpart[FN_REFLEN], log_dirname[FN_REFLEN];
     size_t log_dirpart_len, log_dirname_len;
     dirname_part(log_dirpart, opt_name, &log_dirpart_len);
     dirname_part(log_dirname, from, &log_dirname_len);
 
-    /* log may be empty => relay-log or log-bin did not 
+    /* log may be empty => relay-log or log-bin did not
         hold paths, just filename pattern */
     if (log_dirpart_len > 0)
     {
@@ -1413,6 +1571,11 @@ extern bool semi_sync_last_ack_inited;
 // defined in plugin/semisync/semisync_master.cc
 extern char rpl_semi_sync_master_enabled;
 
+extern "C" void signal_semi_sync_ack(const std::string &file_num, uint file_pos);
+
+bool block_all_dump_threads();
+void unblock_all_dump_threads();
+
 void init_semi_sync_last_acked();
 void destroy_semi_sync_last_acked();
 bool wait_for_semi_sync_ack(const LOG_POS_COORD *const coord,
@@ -1430,6 +1593,11 @@ int get_executed_gtids(std::string* const gtids);
  * @param config_change - Has the committed Config and New Config
  */
 int raft_config_change(THD *thd, std::string config_change);
+
+/**
+ * Block/unblock dump threads
+ */
+int handle_dump_threads(bool block);
 
 int rotate_binlog_file(THD *thd);
 /* This is used to change the mysql_bin_log global MYSQL_BIN_LOG file

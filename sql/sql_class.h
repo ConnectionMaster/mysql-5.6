@@ -197,6 +197,8 @@ enum enum_admission_control_wait_events {
   ADMISSION_CONTROL_THD_WAIT_USER_LOCK = (1U << 2),
   ADMISSION_CONTROL_THD_WAIT_NET_IO = (1U << 3),
   ADMISSION_CONTROL_THD_WAIT_YIELD = (1U << 4),
+  ADMISSION_CONTROL_THD_WAIT_META_DATA_LOCK = (1U << 5),
+  ADMISSION_CONTROL_THD_WAIT_COMMIT = (1U << 6),
 };
 
 enum enum_session_track_gtids {
@@ -257,7 +259,6 @@ extern MYSQL_PLUGIN_IMPORT const char **errmesg;
 
 extern bool volatile shutdown_in_progress;
 
-extern "C" LEX_STRING * thd_query_string (MYSQL_THD thd);
 extern "C" ulong thd_thread_id(MYSQL_THD thd);
 extern "C" char **thd_query(MYSQL_THD thd);
 
@@ -663,6 +664,7 @@ typedef struct system_variables
   my_bool   optimizer_low_limit_heuristic;
   my_bool   optimizer_force_index_for_range;
   my_bool   optimizer_full_scan;
+  double    optimizer_group_by_cost_adjust;
   sql_mode_t sql_mode; ///< which non-standard SQL behaviour should be enabled
   my_bool   error_partial_strict;
   ulong audit_instrumented_event;
@@ -852,6 +854,7 @@ typedef struct system_variables
   my_bool high_precision_processlist;
 
   my_bool enable_block_stale_hlc_read;
+  my_bool enable_hlc_bound;
 
   long admission_control_queue_timeout;
   long admission_control_queue;
@@ -861,10 +864,13 @@ typedef struct system_variables
   long thread_priority;
 
   my_bool sql_stats_snapshot;
+  my_bool sql_stats_auto_snapshot;
 
   my_bool reset_period_status_vars;
 
   my_bool write_throttle_tag_only;
+
+  my_bool sql_stats_read_control;
 } SV;
 
 
@@ -2590,7 +2596,11 @@ public:
   /* whether the session is already in admission control for queries */
   bool is_in_ac = false;
 
+  /* Whether next thd_wait_end() should readmit query. */
   enum enum_admission_control_request_mode readmission_mode = AC_REQUEST_NONE;
+
+  /* Level of nested thd_wait_begin/thd_wait_end calls. */
+  int readmission_nest_level = 0;
 
   /**
     @note
@@ -2983,6 +2993,11 @@ private:
   std::vector<st_slave_gtid_info> slave_gtid_infos;
   /**@}*/
 
+  /**
+   * Relay log positions for the transaction
+   */
+  std::pair<std::string, my_off_t> m_trans_relay_log_pos;
+
   /* The term and index that need to be communicated across different raft
    * plugin hooks. These fields are not protected by locks since they are
    * accessed by the same THD serially during different stages of ordered commit
@@ -3004,6 +3019,17 @@ public:
   }
   void clear_binlog_table_maps() {
     binlog_table_maps= 0;
+  }
+
+  /**
+   * Clear the raft opid which was cached, in preparation for next apply round
+   * Should be only called at a safe point, like finish_commit or ends_group of
+   * a slave applier.
+   *
+   */
+  void clear_raft_opid() {
+    term_= -1;
+    index_= -1;
   }
 
   /*
@@ -3603,6 +3629,11 @@ public:
                                         ulong default_value,
                                         ulong max_value);
 
+  const std::string &get_query_attr(const std::string &qattr_key);
+  const std::string &get_connection_attr(const std::string &cattr_key);
+
+  std::list<std::pair<const char*, const char*> > get_query_tables();
+
   void get_mt_keys_for_write_query(std::array<std::string,
                                    WRITE_STATISTICS_DIMENSION_COUNT> & keys);
 
@@ -3680,12 +3711,24 @@ public:
   PROFILING  profiling;
 #endif
 
+  /* Auto SQL stats snapshot. */
+  void auto_create_sql_stats_snapshot();
+  void release_auto_created_sql_stats_snapshot();
+
+private:
+  /* Whether sql stats snapshot was auto created for this stmt. */
+  bool m_created_auto_stats_snapshot = false;
+
+public:
   /** Current statement digest. */
   sql_digest_state *m_digest;
   /** Current statement digest token array. */
   unsigned char *m_token_array;
   /** Top level statement digest. */
   sql_digest_state m_digest_state;
+
+  void get_query_digest(String *digest_buffer, const char **str,
+                        uint32 *length, const CHARSET_INFO **cs);
 
   /** set to true when running in plan capture mode */
   bool    capture_sql_plan;
@@ -3744,6 +3787,28 @@ public:
     { DBUG_ASSERT(key_name < MT_KEY_MAX); return mt_key_val[key_name]; }
   void mt_key_clear(enum_mt_key key_name)
     { DBUG_ASSERT(key_name < MT_KEY_MAX); mt_key_val_set[key_name] = false; }
+
+  enum enum_mt_table_name
+  {
+    SQL_STATS    = 0,
+    SQL_TEXT     = 1,
+    CLIENT_ATTRS = 2,
+    MT_TABLE_NAME_MAX
+  };
+
+  bool mt_table_filled[MT_TABLE_NAME_MAX] = {false};
+
+  bool get_mt_table_filled(enum_mt_table_name table_name)
+  {
+    DBUG_ASSERT(table_name < MT_TABLE_NAME_MAX);
+    return mt_table_filled[table_name];
+  }
+  void set_mt_table_filled(enum_mt_table_name table_name)
+  {
+    DBUG_ASSERT(table_name < MT_TABLE_NAME_MAX);
+    mt_table_filled[table_name] = true;
+  }
+  void reset_all_mt_table_filled();
 
   /** Current statement instrumentation. */
   PSI_statement_locker *m_statement_psi;
@@ -3848,6 +3913,20 @@ public:
   void clear_slave_gtid_info();
   /**@}*/
 
+  void get_trans_relay_log_pos(const char **file_var, my_off_t *pos_var) const
+  {
+    if (file_var)
+      *file_var= (char*) m_trans_relay_log_pos.first.c_str();
+    if (pos_var)
+      *pos_var= m_trans_relay_log_pos.second;
+  }
+
+  void set_trans_relay_log_pos(const std::string &file, my_off_t pos)
+  {
+    m_trans_relay_log_pos.first= file;
+    m_trans_relay_log_pos.second= pos;
+  }
+
   /* Get the trans marker i.e (term, index) tuple stashed in this THD */
   void get_trans_marker(int64_t *term, int64_t *index) const;
 
@@ -3903,6 +3982,7 @@ public:
     KILLED_NO_VALUE      /* means neither of the states */
   };
   std::atomic<killed_state> killed;
+  char *killed_reason;
 
   /* scramble - random string sent to client on handshake */
   char	     scramble[SCRAMBLE_LENGTH+1];
@@ -3989,6 +4069,7 @@ public:
     each thread that is using LOG_INFO needs to adjust the pointer to it
   */
   LOG_INFO*  current_linfo;
+
   NET*       slave_net;			// network connection from slave -> m.
   /* Used by the sys_var class to store temporary values */
   union
@@ -4139,7 +4220,7 @@ public:
   }
   void shutdown_active_vio();
 #endif
-  void awake(THD::killed_state state_to_set);
+  void awake(THD::killed_state state_to_set, const char *reason = nullptr);
 
   /** Disconnect the associated communication endpoint. */
   void disconnect();
@@ -4250,9 +4331,10 @@ public:
    */
   virtual bool kill_shared_locks(MDL_context_owner *in_use);
 
-  uint kill_one_thread(my_thread_id id, bool only_kill_query);
+  uint kill_one_thread(my_thread_id id, bool only_kill_query,
+                       const char *reason);
   uint kill_one_thread(THD* other, bool only_kill_query) {
-    return kill_one_thread(other->thread_id(), only_kill_query);
+    return kill_one_thread(other->thread_id(), only_kill_query, nullptr);
   }
 
   // End implementation of MDL_context_owner interface.
@@ -4598,7 +4680,16 @@ public:
         JOIN::optimize(), statement cannot possibly run as its caller expected
         => "OK" would be misleading the caller.
       */
-      my_message(err, ER(err), MYF(ME_FATALERROR));
+      if (err == ER_QUERY_INTERRUPTED) {
+        std::string msg = ER(err);
+        if (killed_reason && killed_reason[0] != '\0') {
+          msg.append(", reason: ");
+          msg.append(killed_reason);
+        }
+        my_message(err, msg.c_str(), MYF(ME_FATALERROR));
+      } else {
+        my_message(err, ER(err), MYF(ME_FATALERROR));
+      }
     }
   }
   /* return TRUE if we will abort query if we make a warning now */
@@ -5328,6 +5419,8 @@ public:
   {
     return set_thread_priority(variables.thread_priority);
   }
+
+  bool set_dscp_on_socket();
 };
 
 /*
@@ -6584,6 +6677,16 @@ public:
   void cleanup();
 };
 
+/**
+  Mark a scope as thd_wait_begin/thd_wait_end.
+*/
+class Thd_wait_scope {
+  THD *m_thd;
+public:
+  Thd_wait_scope(THD *thd, int wait_type);
+  ~Thd_wait_scope();
+};
+
 /* Bits in sql_command_flags */
 
 #define CF_CHANGES_DATA           (1U << 0)
@@ -6729,6 +6832,16 @@ inline bool add_group_to_list(THD *thd, Item *item, bool asc)
   return thd->lex->current_select->add_group_to_list(thd, item, asc);
 }
 
+inline int make_table_list(THD *thd, SELECT_LEX *sel,
+                           LEX_STRING *db_name, LEX_STRING *table_name)
+{
+  Table_ident *table_ident;
+  table_ident= new Table_ident(thd, *db_name, *table_name, 1);
+  if (!sel->add_table_to_list(thd, table_ident, 0, 0, TL_READ, MDL_SHARED_READ))
+    return 1;
+  return 0;
+}
+
 #endif /* MYSQL_SERVER */
 
 /**
@@ -6746,5 +6859,9 @@ inline bool add_group_to_list(THD *thd, Item *item, bool asc)
   @retval >= 0	a file handle that can be passed to dup or my_close
 */
 int mysql_tmpfile_path(const char* path, const char* prefix);
+
+char *thd_security_context_internal(
+  THD *thd, char *buffer, unsigned int length, unsigned int max_query_len,
+  my_bool show_query_digest);
 
 #endif /* SQL_CLASS_INCLUDED */

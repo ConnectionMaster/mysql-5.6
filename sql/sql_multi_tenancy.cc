@@ -224,10 +224,19 @@ int multi_tenancy_admit_query(THD *thd,
 {
   bool admission_check = false;
 
+  // Waiting for admission while holding a mutex is prone to deadlocks
+  // if all threads holding AC slots wait for this mutex.
+  DBUG_ASSERT(!thd->mysys_var || !thd->mysys_var->current_mutex);
+
   // Return if THD is already in an admission control
   // (e.g. part of a multi query packet).
-  if (thd->is_in_ac)
+  if (thd->is_in_ac) {
+    if (admission_control_multiquery_filter &&
+        filter_command(thd->lex->sql_command)) {
+      multi_tenancy_exit_query(thd);
+    }
     return 0;
+  }
 
   /*
    * Admission control check will be enforced if ALL of the following

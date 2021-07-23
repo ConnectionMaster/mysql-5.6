@@ -270,12 +270,10 @@ private:
 extern PSI_rwlock_key key_rwlock_Raft_replication_delegate_lock;
 #endif
 
-class Raft_replication_delegate
-  :public Delegate {
+class Raft_replication_delegate : public Delegate {
 public:
 
-  Raft_replication_delegate()
-  : Delegate(
+  Raft_replication_delegate() : Delegate(
 #ifdef HAVE_PSI_INTERFACE
              key_rwlock_Raft_replication_delegate_lock
 #endif
@@ -288,11 +286,7 @@ public:
                      op_type= RaftReplicateMsgOpType::OP_TYPE_TRX);
   int before_commit(THD *thd, bool all);
 
-  int setup_flush(THD *thd, bool is_relay_log,
-                  IO_CACHE* log_file_cache,
-                  const char *log_prefix, const char *log_name,
-                  mysql_mutex_t *lock_log, mysql_mutex_t *lock_index,
-                  mysql_cond_t *update_cond, ulong *cur_log_ext, int context);
+  int setup_flush(THD *thd, Observer::st_setup_flush_arg *arg);
 
   int before_shutdown(THD *thd);
   int register_paths(THD *thd, const std::string& s_uuid,
@@ -405,4 +399,9 @@ struct RaftRotateInfo {
   // rotation to be initiated by server to get consensus on a
   // config change (add/remove/modify of the ring)
   bool config_change_rotate= false;
+  // This is the opid of the rotate event which is either
+  // passed in by plugin or obtained from before_flush.
+  // During rotation of raft logs, this is put into Metadata event
+  // as previous opid
+  std::pair<int64_t, int64_t> rotate_opid= std::make_pair(0,0);
 };

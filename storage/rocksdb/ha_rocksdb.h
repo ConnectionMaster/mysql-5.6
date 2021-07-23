@@ -314,18 +314,15 @@ class ha_rocksdb : public my_core::handler {
   bool is_ascending(const Rdb_key_def &keydef,
                     enum ha_rkey_function find_flag) const
       MY_ATTRIBUTE((__nonnull__, __warn_unused_result__));
-  void setup_iterator_bounds(const Rdb_key_def &kd,
-                             const rocksdb::Slice &eq_cond, size_t bound_len,
-                             uchar *const lower_bound, uchar *const upper_bound,
-                             rocksdb::Slice *lower_bound_slice,
-                             rocksdb::Slice *upper_bound_slice);
-  bool check_bloom_and_set_bounds(THD *thd, const Rdb_key_def &kd,
-                                  const rocksdb::Slice &eq_cond,
-                                  const bool use_all_keys, size_t bound_len,
-                                  uchar *const lower_bound,
-                                  uchar *const upper_bound,
-                                  rocksdb::Slice *lower_bound_slice,
-                                  rocksdb::Slice *upper_bound_slice);
+  static void setup_iterator_bounds(const Rdb_key_def &kd,
+                                    const rocksdb::Slice &eq_cond,
+                                    size_t bound_len, uchar *const lower_bound,
+                                    uchar *const upper_bound,
+                                    rocksdb::Slice *lower_bound_slice,
+                                    rocksdb::Slice *upper_bound_slice);
+  static bool can_use_bloom_filter(THD *thd, const Rdb_key_def &kd,
+                                   const rocksdb::Slice &eq_cond,
+                                   const bool use_all_keys);
   void setup_scan_iterator(const Rdb_key_def &kd, rocksdb::Slice *slice,
                            const bool use_all_keys, const uint eq_cond_len)
       MY_ATTRIBUTE((__nonnull__));
@@ -374,13 +371,6 @@ class ha_rocksdb : public my_core::handler {
 
   void set_last_rowkey(const uchar *const old_data);
 
-  /*
-    For the active index, indicates which columns must be covered for the
-    current lookup to be covered. If the bitmap field is null, that means this
-    index does not cover the current lookup for any record.
-   */
-  MY_BITMAP m_lookup_bitmap = {nullptr, 0, 0, nullptr, nullptr};
-
   int alloc_key_buffers(const TABLE *const table_arg,
                         const Rdb_tbl_def *const tbl_def_arg,
                         bool alloc_alter_buffers = false)
@@ -389,6 +379,11 @@ class ha_rocksdb : public my_core::handler {
 
   // the buffer size should be at least 2*Rdb_key_def::INDEX_NUMBER_SIZE
   rocksdb::Range get_range(const int i, uchar buf[]) const;
+
+  void records_in_range_internal(uint inx, key_range *const min_key,
+                                 key_range *const max_key, int64 disk_size,
+                                 int64 rows, ulonglong *total_size,
+                                 ulonglong *row_count);
 
   /*
     Perf timers for data reads
@@ -671,6 +666,12 @@ class ha_rocksdb : public my_core::handler {
   // Note: the following is only used by DS-MRR, so not needed for MyRocks:
   // longlong get_memory_buffer_size() const override { return 1024; }
 
+  static bool check_bloom_and_set_bounds(
+      THD *thd, const Rdb_key_def &kd, const rocksdb::Slice &eq_cond,
+      const bool use_all_keys, size_t bound_len, uchar *const lower_bound,
+      uchar *const upper_bound, rocksdb::Slice *lower_bound_slice,
+      rocksdb::Slice *upper_bound_slice);
+
  private:
   // true <=> The scan uses the default MRR implementation, just redirect all
   // calls to it
@@ -948,6 +949,10 @@ class ha_rocksdb : public my_core::handler {
                            key_range *const max_key) override
       MY_ATTRIBUTE((__warn_unused_result__));
 
+  ulonglong records_size_in_range(uint inx, key_range *const min_key,
+                                  key_range *const max_key) override
+      MY_ATTRIBUTE((__warn_unused_result__));
+
   int delete_table(Rdb_tbl_def *const tbl);
   int delete_table(const char *const from) override
       MY_ATTRIBUTE((__warn_unused_result__));
@@ -956,7 +961,7 @@ class ha_rocksdb : public my_core::handler {
       MY_ATTRIBUTE((__warn_unused_result__));
   int create_table(const std::string &table_name, const TABLE *table_arg,
                    ulonglong auto_increment_value);
-  int truncate_table(Rdb_tbl_def *tbl_def, const TABLE *table_arg,
+  int truncate_table(Rdb_tbl_def *tbl_def, TABLE *table_arg,
                      ulonglong auto_increment_value);
   bool check_if_incompatible_data(HA_CREATE_INFO *const info,
                                   uint table_changes) override
@@ -1015,6 +1020,10 @@ class ha_rocksdb : public my_core::handler {
   int adjust_handler_stats_table_scan();
 
   void update_row_read(ulonglong count);
+  static void inc_covered_sk_lookup();
+
+  void build_decoder();
+  void check_build_decoder();
 
  public:
   virtual void rpl_before_delete_rows() override;
@@ -1030,6 +1039,9 @@ class ha_rocksdb : public my_core::handler {
   bool m_in_rpl_update_rows;
 
   bool m_force_skip_unique_check;
+
+  /* Need to build decoder on next read operation */
+  bool m_need_build_decoder;
 };
 
 /*
@@ -1109,6 +1121,9 @@ bool should_log_rejected_select_bypass();
 /* Whether we should log failed unsupported SELECT bypass */
 bool should_log_failed_select_bypass();
 
+/* Whether we should allow non-optimal filters in SELECT bypass */
+bool should_allow_filters_select_bypass();
+
 uint32_t get_select_bypass_rejected_query_history_size();
 
 uint32_t get_select_bypass_debug_row_delay();
@@ -1121,8 +1136,10 @@ Rdb_transaction *&get_tx_from_thd(THD *const thd);
 const rocksdb::ReadOptions &rdb_tx_acquire_snapshot(Rdb_transaction *tx);
 
 rocksdb::Iterator *rdb_tx_get_iterator(
-    Rdb_transaction *tx, const rocksdb::ReadOptions &options,
-    rocksdb::ColumnFamilyHandle *const column_family);
+    Rdb_transaction *tx, rocksdb::ColumnFamilyHandle *const column_family,
+    bool skip_bloom, bool fill_cache, const rocksdb::Slice &lower_bound_slice,
+    const rocksdb::Slice &upper_bound_slice, bool read_current = false,
+    bool create_snapshot = true);
 
 rocksdb::Status rdb_tx_get(Rdb_transaction *tx,
                            rocksdb::ColumnFamilyHandle *const column_family,
@@ -1158,10 +1175,6 @@ inline void rocksdb_smart_next(bool seek_backward,
 // to IOError or corruption. The good practice is always check it.
 // https://github.com/facebook/rocksdb/wiki/Iterator#error-handling
 bool is_valid_iterator(rocksdb::Iterator *scan_it);
-
-bool can_use_bloom_filter(THD *thd, const Rdb_key_def &kd,
-                          const rocksdb::Slice &eq_cond,
-                          const bool use_all_keys);
 
 bool rdb_tx_started(Rdb_transaction *tx);
 

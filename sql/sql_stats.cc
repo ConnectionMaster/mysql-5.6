@@ -1,12 +1,15 @@
 #include "column_statistics_dt.h"
+#include "mysqld.h"
 #include "sql_base.h"
 #include "sql_parse.h"
 #include "sql_show.h"
 #include "sql_string.h"
 #include "sql_stats.h"
+#include "structs.h"
 #include "tztime.h"                             // struct Time_zone
 #include "rpl_master.h"                         // get_current_replication_lag
 #include <mysql/plugin_rim.h>
+#include <handler.h>
 
 /* Global map to track the number of active identical sql statements */
 static std::unordered_map<md5_key, uint> global_active_sql;
@@ -776,9 +779,16 @@ static void populate_write_statistics(
 */
 void store_write_statistics(THD *thd)
 {
+  // write_stats_frequency may be updated dynamically. Caching it for the
+  // logic below
+  ulong write_stats_frequency_cached = write_stats_frequency;
+  if (write_stats_frequency_cached == 0) {
+    return;
+  }
+
   bool lock_acquired = mt_lock(&LOCK_global_write_statistics);
   time_t timestamp = my_time(0);
-  int time_bucket_key = timestamp - (timestamp % write_stats_frequency);
+  int time_bucket_key = timestamp - (timestamp % write_stats_frequency_cached);
   auto time_bucket_iter = global_write_statistics_map.begin();
 
   DBUG_EXECUTE_IF("dbug.add_write_stats_to_most_recent_bucket", {
@@ -905,6 +915,8 @@ ST_FIELD_INFO write_throttling_rules_fields_info[]=
     SKIP_OPEN_TABLE},
   {"TYPE", 16, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE},
   {"VALUE", MD5_BUFF_LENGTH, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE},
+  {"THROTTLE_RATE", MY_INT64_NUM_DECIMAL_DIGITS, MYSQL_TYPE_LONGLONG,
+    0, MY_I_S_UNSIGNED, 0, SKIP_OPEN_TABLE},
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE}
 };
 
@@ -916,12 +928,31 @@ const std::string WRITE_THROTTLING_MODE_STRING[] = {"MANUAL", "AUTO"};
 
 /*
   free_global_write_throttling_rules
-    Frees global_write_throttling_rules data structure
+    Frees auto and manual rules from global_write_throttling_rules data structure
 */
 void free_global_write_throttling_rules() {
   bool lock_acquired = mt_lock(&LOCK_global_write_throttling_rules);
   for(uint i = 0; i<WRITE_STATISTICS_DIMENSION_COUNT; i++) {
     global_write_throttling_rules[i].clear();
+  }
+  mt_unlock(lock_acquired, &LOCK_global_write_throttling_rules);
+}
+
+/*
+  free_global_write_auto_throttling_rules
+    Frees only auto rules from global_write_throttling_rules data structure
+*/
+void free_global_write_auto_throttling_rules() {
+  bool lock_acquired = mt_lock(&LOCK_global_write_throttling_rules);
+  for (auto &rules : global_write_throttling_rules) {
+    auto rules_iter = rules.begin();
+    while (rules_iter != rules.end()) {
+      if (rules_iter->second.mode == WTR_AUTO) {
+        rules_iter = rules.erase(rules_iter);
+      } else {
+        ++rules_iter;
+      }
+    }
   }
   mt_unlock(lock_acquired, &LOCK_global_write_throttling_rules);
 }
@@ -939,6 +970,52 @@ enum_wtr_dimension get_wtr_dimension_from_str(std::string type_str) {
     type--;
 
   return static_cast<enum_wtr_dimension>(type);
+}
+
+/*
+  Stores a user specified order in which throttling system should throttle
+  write throttling dimensions in case of replication lag
+*/
+bool store_write_throttle_permissible_dimensions_in_order(char *new_value) {
+  if (strcmp(new_value, "OFF") == 0) {
+    mysql_mutex_lock(&LOCK_replication_lag_auto_throttling);
+    write_throttle_permissible_dimensions_in_order.clear();
+    mysql_mutex_unlock(&LOCK_replication_lag_auto_throttling);
+    return false;
+  }
+  // copy the string to avoid mutating new var value.
+  char * new_value_copy = (char *)my_malloc(strlen(new_value)+ 1, MYF(MY_WME));
+  if(new_value_copy == nullptr) {
+    return true; // failure allocating memory
+  }
+  strcpy(new_value_copy, new_value);
+  char* wtr_dim_str;
+  enum_wtr_dimension wtr_dim;
+  std::vector<enum_wtr_dimension> new_dimensions;
+  bool result = false;
+
+  wtr_dim_str = strtok(new_value_copy, ",");
+  while (wtr_dim_str != nullptr) {
+    wtr_dim = get_wtr_dimension_from_str(wtr_dim_str);
+    if (wtr_dim == WTR_DIM_UNKNOWN) {
+      result = true; // not a valid dimension string, failure
+      break;
+    }
+    auto it = std::find(new_dimensions.begin(), new_dimensions.end(), wtr_dim);
+    if (it != new_dimensions.end()) {
+      result = true; // duplicate dimension, failure
+      break;
+    }
+    new_dimensions.push_back(wtr_dim);
+    wtr_dim_str = strtok(nullptr, ",");
+  }
+  if (!result) {
+    mysql_mutex_lock(&LOCK_replication_lag_auto_throttling);
+    write_throttle_permissible_dimensions_in_order = new_dimensions;
+    mysql_mutex_unlock(&LOCK_replication_lag_auto_throttling);
+  }
+  my_free(new_value_copy);
+  return result;
 }
 
 /*
@@ -967,20 +1044,32 @@ bool store_write_throttling_rules(THD *thd) {
     WRITE_THROTTLING_RULE rule;
     rule.mode = WTR_MANUAL; // manual
     rule.create_time = my_time(0);
+    rule.throttle_rate = 100; // manual rules are fully throttled
 
     bool lock_acquired = mt_lock(&LOCK_global_write_throttling_rules);
     auto & rules_map = global_write_throttling_rules[wtr_dim];
     auto iter = rules_map.find(value_str);
+    bool remove_from_currently_throttled_entities = false;
     if (op == '+') {
-      if (iter != rules_map.end())
+      if (iter != rules_map.end()) {
+        // If manually overriding an auto rule, remove it from
+        // currently_throttled_entities queue
+        if (rules_map[value_str].mode == WTR_AUTO)
+          remove_from_currently_throttled_entities = true;
         rules_map[value_str] = rule;
+      }
       else
         rules_map.insert(std::make_pair(value_str, rule));
     } else { // op == '-'
       if (iter != rules_map.end()) {
+        // If manually overriding an auto rule, remove it from
+        // currently_throttled_entities queue
+        if (rules_map[value_str].mode == WTR_AUTO)
+          remove_from_currently_throttled_entities = true;
         rules_map.erase(iter);
       }
-      // also remove it from the currently_throttled_entities queue if present
+    }
+    if (remove_from_currently_throttled_entities) {
       for(auto q_iter = currently_throttled_entities.begin();
           q_iter != currently_throttled_entities.end(); q_iter++)
       {
@@ -1032,6 +1121,9 @@ int fill_write_throttling_rules(THD *thd, TABLE_LIST *tables, Item *cond)
 
       // value
       table->field[f++]->store(rules_iter->first.c_str(), rules_iter->first.length(), system_charset_info);
+
+      // throttle_rate
+      table->field[f++]->store(rules_iter->second.throttle_rate, TRUE);
 
       if (schema_table_store_record(thd, table))
       {
@@ -1289,17 +1381,17 @@ void static update_monitoring_status_for_entity(std::string name, enum_wtr_dimen
       WRITE_THROTTLING_RULE rule;
       rule.mode = WTR_AUTO; // auto
       rule.create_time = my_time(0);
+      rule.throttle_rate = write_throttle_rate_step;
 
       bool lock_acquired = mt_lock(&LOCK_global_write_throttling_rules);
       auto & rules_map = global_write_throttling_rules[dimension];
       auto iter = rules_map.find(name);
       if (iter == rules_map.end()) {
         rules_map.insert(std::make_pair(name, rule));
+        // insert the entity into currently_throttled_entities queue
+        currently_throttled_entities.push_back(std::make_pair(name, dimension));
       }
       mt_unlock(lock_acquired, &LOCK_global_write_throttling_rules);
-
-      // insert the entity into currently_throttled_entities queue
-      currently_throttled_entities.push_back(std::make_pair(name, dimension));
 
       // reset currently_monitored_entity
       currently_monitored_entity.reset();
@@ -1350,50 +1442,104 @@ std::pair<std::string, std::string> get_top_two_entities(
     releases one of the previously throttled entities if replication lag is below
     safe threshold.
 */
-void check_lag_and_throttle() {
+void check_lag_and_throttle(time_t time_now) {
   ulong lag = get_current_replication_lag();
 
   if (lag < write_stop_throttle_lag_milliseconds) {
-    // Replication lag below safe threshold, release at most one throttled
-    // entity and erase corresponding throttling rule
+    // Replication lag below safe threshold, reduce throttle rate or release
+    // at most one throttled entity. If releasing, erase corresponding throttling rule.
     if (currently_throttled_entities.empty())
       return;
     auto throttled_entity = currently_throttled_entities.front();
-    currently_throttled_entities.pop_front();
 
     enum_wtr_dimension wtr_dim = throttled_entity.second;
     std::string name = throttled_entity.first;
 
     bool lock_acquired = mt_lock(&LOCK_global_write_throttling_rules);
-    auto rule_iter = global_write_throttling_rules[wtr_dim].find(name);
-    if (rule_iter != global_write_throttling_rules[wtr_dim].end()
-      && rule_iter->second.mode == WTR_AUTO) {
-      global_write_throttling_rules[wtr_dim].erase(rule_iter);
+    auto & rules_map = global_write_throttling_rules[wtr_dim];
+    auto iter = rules_map.find(name);
+    if (iter != rules_map.end()) {
+      if (iter->second.mode == WTR_MANUAL) {
+        // Safe guard. A manual rule should not end up in currently_throttled_entities
+        // But if it does, simply pop it out.
+        currently_throttled_entities.pop_front();
+      } else if (iter->second.throttle_rate > write_throttle_rate_step) {
+        iter->second.throttle_rate -= write_throttle_rate_step;
+      } else {
+        global_write_throttling_rules[wtr_dim].erase(iter);
+        currently_throttled_entities.pop_front();
+      }
     }
     mt_unlock(lock_acquired, &LOCK_global_write_throttling_rules);
   }
 
   if (lag > write_start_throttle_lag_milliseconds) {
+    // Replication lag above threshold, Check if we can increase throttle rate for last throttled entity
+    if (!currently_throttled_entities.empty()) {
+      auto last_throttled_entity = currently_throttled_entities.back();
+      bool throttle_rate_increased = false;
+      bool lock_acquired = mt_lock(&LOCK_global_write_throttling_rules);
+      auto & rules_map = global_write_throttling_rules[last_throttled_entity.second];
+      auto iter = rules_map.find(last_throttled_entity.first);
+      if (iter != rules_map.end() && iter->second.throttle_rate < 100) {
+        iter->second.throttle_rate = std::min((uint)100,
+          iter->second.throttle_rate + write_throttle_rate_step);
+        throttle_rate_increased = true;
+      }
+      mt_unlock(lock_acquired, &LOCK_global_write_throttling_rules);
+      if (throttle_rate_increased)
+        return;
+    }
+
     // Replication lag above threshold, find an entity to throttle
     if (global_write_statistics_map.size() == 0) {
       // no stats collected so far
       return;
     }
 
+    // write_stats_frequency may be updated dynamically. Caching it for the
+    // logic below
+    ulong write_stats_frequency_cached = write_stats_frequency;
+    if (write_stats_frequency_cached == 0) {
+      return;
+    }
+
     bool lock_acquired = mt_lock(&LOCK_global_write_statistics);
 
-    TIME_BUCKET_STATS & latest_write_stats = global_write_statistics_map.front().second;
-    // Sort dimensions in order of cardinality. If the cardinality is the same,
-    // we want to throttle sql_id > shard > client > user
-    auto cardinality_cmp = [&latest_write_stats](const enum_wtr_dimension &a, const enum_wtr_dimension &b)
-    {
-      auto a_size = latest_write_stats[a].size();
-      auto b_size = latest_write_stats[b].size();
-      return  a_size > b_size || (a_size == b_size && a > b);
-    };
-    std::array<enum_wtr_dimension, WRITE_STATISTICS_DIMENSION_COUNT> dimensions =
-      { WTR_DIM_USER, WTR_DIM_CLIENT, WTR_DIM_SHARD, WTR_DIM_SQL_ID};
-    std::sort(dimensions.begin(), dimensions.end(), cardinality_cmp);
+    // Find latest write_statistics time bucket that is complete.
+    // Example - For write_stats_frequency=6s, At t=8s, this method should
+    // return write_stats bucket for stats between t=0 to t=6 i.e. bucket_key=0
+    // and not bucket_key=6 which is incomplete and only has 2s worth of
+    // write_stats data;
+    int time_bucket_key = time_now - (time_now % write_stats_frequency_cached) - write_stats_frequency_cached;
+    auto latest_write_stats_iter = global_write_statistics_map.begin();
+
+    // For testing purpose, force use the latest write stats bucket for culprit
+    // analysis
+    bool dbug_skip_last_complete_bucket_check = false;
+    DBUG_EXECUTE_IF("dbug.skip_last_complete_bucket_check",
+      {dbug_skip_last_complete_bucket_check = true;});
+
+    if (!dbug_skip_last_complete_bucket_check) {
+      if (latest_write_stats_iter->first != time_bucket_key) {
+        // move to the second from front time bucket
+        latest_write_stats_iter++;
+      }
+      if(latest_write_stats_iter == global_write_statistics_map.end()
+        || latest_write_stats_iter->first != time_bucket_key) {
+        // no complete write statistics bucket for analysis
+        // reset currently monitored entity, if any, as there's been a
+        // significant gap in time since we last did culprit analysis. It is
+        // outdated.
+        currently_monitored_entity.reset();
+        mt_unlock(lock_acquired, &LOCK_global_write_statistics);
+        return;
+      }
+    }
+    TIME_BUCKET_STATS & latest_write_stats = latest_write_stats_iter->second;
+
+    std::vector<enum_wtr_dimension> & dimensions =
+      write_throttle_permissible_dimensions_in_order;
 
     bool is_fallback_entity_set = false;
     std::pair<std::string, enum_wtr_dimension> fallback_entity;
@@ -1809,23 +1955,23 @@ static bool set_sql_text_attributes(
 {
   sql_text_struct->sql_type = sql_type;
 
-  // Compute digest just to get length.
+  // Compute digest text. This is anyway needed to get the full length.
   String digest_text;
   compute_digest_text(digest_storage, &digest_text);
   sql_text_struct->sql_text_length = digest_text.length();
 
-  // Allocate just the minimum necessary token array storage.
-  uint token_array_len = std::min((uint)digest_storage->length(),
-                                  max_sql_text_storage_size);
-  if (!(sql_text_struct->token_array_storage =
-      (unsigned char *)my_malloc(token_array_len, MYF(MY_WME))))
+  // Store the digest text now instead of the token array.
+  // Compute the minimum necessary length and allocate the storage.
+  sql_text_struct->sql_text_arr_len = std::min(
+      sql_text_struct->sql_text_length,
+      (size_t)max_sql_text_storage_size);
+  if (!(sql_text_struct->sql_text=
+        ((char*)my_malloc(sql_text_struct->sql_text_arr_len, MYF(MY_WME)))))
   {
     return false;
   }
-  sql_text_struct->digest_storage.reset(sql_text_struct->token_array_storage,
-                                        token_array_len);
-
-  sql_text_struct->digest_storage.copy(digest_storage);
+  memcpy(sql_text_struct->sql_text, digest_text.c_ptr(),
+         sql_text_struct->sql_text_arr_len);
 
   return true;
 }
@@ -1901,7 +2047,7 @@ static void free_sql_stats_maps(Sql_stats_maps &stats_maps)
   {
     if (it->second)
     {
-      my_free(it->second->token_array_storage);
+      my_free(it->second->sql_text);
       my_free(it->second);
     }
   }
@@ -2207,7 +2353,7 @@ void update_sql_stats_after_statement(THD *thd, SHARED_SQL_STATS *stats, char* s
     if (!ret.second)
     {
       sql_print_error("Failed to insert SQL_TEXT into the hash map.");
-      my_free((char*)sql_text->token_array_storage);
+      my_free((char*)sql_text->sql_text);
       my_free((char*)sql_text);
       mt_unlock(lock_acquired, &LOCK_global_sql_stats);
       return;
@@ -2442,6 +2588,9 @@ public:
   Stats_iterator(Stats_map<T> *&snapshot_map, Stats_map<T> *&global_map,
                  THD *thd)
   {
+    /* Before starting iteration see if auto snapshot should be created. */
+    thd->auto_create_sql_stats_snapshot();
+
     /* Iterator always takes read lock on snapshot even if snapshot doesn't
        exist. Since in that case it will also take the global stats mutex,
        that would have blocked creation of new snapshot anyway. */
@@ -2562,120 +2711,159 @@ private:
   }
 };
 
+/*
+ Pre-conditions to check beefore filling SQL_STATISTICS, SQL_TEXT and
+ CLIENT_ATTRIBUTES tables.
+*/
+static int check_pre_fill_conditions(THD *thd, const char *table_name,
+                                     THD::enum_mt_table_name table_name_enum,
+                                     const char *mutex_name,
+                                     bool check_mt_access_control = true)
+{
+  int result = 0;
+
+  if (!thd->variables.sql_stats_read_control)
+  {
+    my_error(ER_IS_TABLE_READ_DISABLED, MYF(0), table_name);
+    result = -1;
+  }
+
+  if (!result &&
+      check_mt_access_control && mt_tables_access_control &&
+      check_global_access(thd, PROCESS_ACL))
+  {
+    result = -1;
+  }
+
+  if (!result && thd->get_mt_table_filled(table_name_enum))
+  {
+    my_error(ER_IS_TABLE_REPEATED_READ, MYF(0),
+        table_name, mutex_name);
+    result = -1;
+  } else {
+    thd->set_mt_table_filled(table_name_enum);
+  }
+
+  return result;
+}
+
 /* Fills the SQL_STATISTICS table. */
 int fill_sql_stats(THD *thd, TABLE_LIST *tables, Item *cond)
 {
   DBUG_ENTER("fill_sql_stats");
-  TABLE* table= tables->table;
-  Stats_iterator<SQL_STATS *> iter(sql_stats_snapshot.stats,
-                                   global_sql_stats.stats, thd);
-  MYSQL_TIME time;
-  ID_NAME_MAP db_map;
-  ID_NAME_MAP user_map;
-  fill_invert_map(DB_MAP_NAME, &db_map);
-  fill_invert_map(USER_MAP_NAME, &user_map);
 
-  int result = 0;
-  if (mt_tables_access_control && check_global_access(thd, PROCESS_ACL))
-    result = -1;
+  int result = check_pre_fill_conditions(thd, "SQL_STATISTICS", THD::SQL_STATS,
+                                         "global_sql_stats");
 
-  for (; !result && iter.is_valid(); iter.move_to_next())
+  if (!result)
   {
-    int f= 0;
-    SQL_STATS *sql_stats = iter.get_value();
+    TABLE* table= tables->table;
+    Stats_iterator<SQL_STATS *> iter(sql_stats_snapshot.stats,
+                                     global_sql_stats.stats, thd);
+    MYSQL_TIME time;
+    ID_NAME_MAP db_map;
+    ID_NAME_MAP user_map;
+    fill_invert_map(DB_MAP_NAME, &db_map);
+    fill_invert_map(USER_MAP_NAME, &user_map);
 
-    /* skip this one if the statistics are not valid */
-    if (!valid_sql_stats(sql_stats))
-      continue;
-
-    restore_record(table, s->default_values);
-
-    char sql_id_hex_string[MD5_BUFF_LENGTH];
-    array_to_hex(sql_id_hex_string, sql_stats->sql_id, MD5_HASH_SIZE);
-
-    /* SQL ID */
-    table->field[f++]->store(sql_id_hex_string, MD5_BUFF_LENGTH,
-                             system_charset_info);
-    /* PLAN ID */
-    if (sql_stats->plan_id_set)
+    for (; iter.is_valid(); iter.move_to_next())
     {
-      char plan_id_hex_string[MD5_BUFF_LENGTH];
-      array_to_hex(plan_id_hex_string, sql_stats->plan_id, MD5_HASH_SIZE);
+      int f= 0;
+      SQL_STATS *sql_stats = iter.get_value();
 
-      table->field[f]->set_notnull();
-      table->field[f++]->store(plan_id_hex_string, MD5_BUFF_LENGTH,
+      /* skip this one if the statistics are not valid */
+      if (!valid_sql_stats(sql_stats))
+        continue;
+
+      restore_record(table, s->default_values);
+
+      char sql_id_hex_string[MD5_BUFF_LENGTH];
+      array_to_hex(sql_id_hex_string, sql_stats->sql_id, MD5_HASH_SIZE);
+
+      /* SQL ID */
+      table->field[f++]->store(sql_id_hex_string, MD5_BUFF_LENGTH,
                                system_charset_info);
+      /* PLAN ID */
+      if (sql_stats->plan_id_set)
+      {
+        char plan_id_hex_string[MD5_BUFF_LENGTH];
+        array_to_hex(plan_id_hex_string, sql_stats->plan_id, MD5_HASH_SIZE);
+
+        table->field[f]->set_notnull();
+        table->field[f++]->store(plan_id_hex_string, MD5_BUFF_LENGTH,
+                                 system_charset_info);
+      }
+      else
+        table->field[f++]->set_null();
+
+      char client_id_hex_string[MD5_BUFF_LENGTH];
+      array_to_hex(client_id_hex_string, sql_stats->client_id, MD5_HASH_SIZE);
+
+      /* CLIENT ID */
+      table->field[f++]->store(client_id_hex_string, MD5_BUFF_LENGTH,
+                               system_charset_info);
+
+      const char *a_name;
+      /* Table Schema */
+      if (!(a_name= get_name(&db_map, sql_stats->db_id)))
+        a_name= "UNKNOWN";
+      table->field[f++]->store(a_name, strlen(a_name), system_charset_info);
+
+      /* User Name */
+      if (!(a_name= get_name(&user_map, sql_stats->user_id)))
+        a_name= "UNKNOWN";
+      table->field[f++]->store(a_name, strlen(a_name), system_charset_info);
+
+      /* Query Sample Text */
+      table->field[f++]->store(sql_stats->query_sample_text,
+                              strlen(sql_stats->query_sample_text),
+                              system_charset_info);
+      /* Query Last Sample Timestamp */
+      if (sql_stats->query_sample_seen == 0) {
+        table->field[f++]->set_null();
+      } else {
+        thd->variables.time_zone->gmt_sec_to_TIME(
+            &time, (my_time_t)sql_stats->query_sample_seen);
+        table->field[f]->set_notnull();
+        table->field[f++]->store_time(&time);
+      }
+
+      /* Execution Count */
+      table->field[f++]->store(sql_stats->count, TRUE);
+      /* Skipped Count */
+      table->field[f++]->store(sql_stats->skipped_count, TRUE);
+      /* Rows inserted */
+      table->field[f++]->store(sql_stats->shared_stats.rows_inserted, TRUE);
+      /* Rows updated */
+      table->field[f++]->store(sql_stats->shared_stats.rows_updated, TRUE);
+      /* Rows deleted */
+      table->field[f++]->store(sql_stats->shared_stats.rows_deleted, TRUE);
+      /* Rows read */
+      table->field[f++]->store(sql_stats->shared_stats.rows_read, TRUE);
+      /* Rows returned to the client */
+      table->field[f++]->store(sql_stats->rows_sent, TRUE);
+      /* Total CPU in microseconds */
+      table->field[f++]->store(sql_stats->shared_stats.stmt_cpu_utime, TRUE);
+      /* Total Elapsed time in microseconds */
+      table->field[f++]->store(sql_stats->shared_stats.stmt_elapsed_utime, TRUE);
+      /* Bytes written to temp table space */
+      table->field[f++]->store(sql_stats->tmp_table_bytes_written, TRUE);
+      /* Bytes written to filesort space */
+      table->field[f++]->store(sql_stats->filesort_bytes_written, TRUE);
+      /* Index dive count */
+      table->field[f++]->store(sql_stats->index_dive_count, TRUE);
+      /* Index dive CPU */
+      table->field[f++]->store(sql_stats->index_dive_cpu, TRUE);
+      /* Compilation CPU */
+      table->field[f++]->store(sql_stats->compilation_cpu, TRUE);
+      /* Tmp table disk usage */
+      table->field[f++]->store(sql_stats->tmp_table_disk_usage, TRUE);
+      /* Filesort disk usage */
+      table->field[f++]->store(sql_stats->filesort_disk_usage, TRUE);
+
+      if (schema_table_store_record(thd, table))
+        result = -1;
     }
-    else
-      table->field[f++]->set_null();
-
-    char client_id_hex_string[MD5_BUFF_LENGTH];
-    array_to_hex(client_id_hex_string, sql_stats->client_id, MD5_HASH_SIZE);
-
-    /* CLIENT ID */
-    table->field[f++]->store(client_id_hex_string, MD5_BUFF_LENGTH,
-                             system_charset_info);
-
-    const char *a_name;
-    /* Table Schema */
-    if (!(a_name= get_name(&db_map, sql_stats->db_id)))
-      a_name= "UNKNOWN";
-    table->field[f++]->store(a_name, strlen(a_name), system_charset_info);
-
-    /* User Name */
-    if (!(a_name= get_name(&user_map, sql_stats->user_id)))
-      a_name= "UNKNOWN";
-    table->field[f++]->store(a_name, strlen(a_name), system_charset_info);
-
-    /* Query Sample Text */
-    table->field[f++]->store(sql_stats->query_sample_text,
-                             strlen(sql_stats->query_sample_text),
-                             system_charset_info);
-    /* Query Last Sample Timestamp */
-		if (sql_stats->query_sample_seen == 0) {
-			table->field[f++]->set_null();
-		} else {
-			thd->variables.time_zone->gmt_sec_to_TIME(
-	        &time, (my_time_t)sql_stats->query_sample_seen);
-			table->field[f]->set_notnull();
-	    table->field[f++]->store_time(&time);
-		}
-
-    /* Execution Count */
-    table->field[f++]->store(sql_stats->count, TRUE);
-    /* Skipped Count */
-    table->field[f++]->store(sql_stats->skipped_count, TRUE);
-    /* Rows inserted */
-    table->field[f++]->store(sql_stats->shared_stats.rows_inserted, TRUE);
-    /* Rows updated */
-    table->field[f++]->store(sql_stats->shared_stats.rows_updated, TRUE);
-    /* Rows deleted */
-    table->field[f++]->store(sql_stats->shared_stats.rows_deleted, TRUE);
-    /* Rows read */
-    table->field[f++]->store(sql_stats->shared_stats.rows_read, TRUE);
-    /* Rows returned to the client */
-    table->field[f++]->store(sql_stats->rows_sent, TRUE);
-    /* Total CPU in microseconds */
-    table->field[f++]->store(sql_stats->shared_stats.stmt_cpu_utime, TRUE);
-    /* Total Elapsed time in microseconds */
-    table->field[f++]->store(sql_stats->shared_stats.stmt_elapsed_utime, TRUE);
-    /* Bytes written to temp table space */
-    table->field[f++]->store(sql_stats->tmp_table_bytes_written, TRUE);
-    /* Bytes written to filesort space */
-    table->field[f++]->store(sql_stats->filesort_bytes_written, TRUE);
-    /* Index dive count */
-    table->field[f++]->store(sql_stats->index_dive_count, TRUE);
-    /* Index dive CPU */
-    table->field[f++]->store(sql_stats->index_dive_cpu, TRUE);
-    /* Compilation CPU */
-    table->field[f++]->store(sql_stats->compilation_cpu, TRUE);
-    /* Tmp table disk usage */
-    table->field[f++]->store(sql_stats->tmp_table_disk_usage, TRUE);
-    /* Filesort disk usage */
-    table->field[f++]->store(sql_stats->filesort_disk_usage, TRUE);
-
-    if (schema_table_store_record(thd, table))
-      result = -1;
   }
 
   DBUG_RETURN(result);
@@ -2685,45 +2873,47 @@ int fill_sql_stats(THD *thd, TABLE_LIST *tables, Item *cond)
 int fill_sql_text(THD *thd, TABLE_LIST *tables, Item *cond)
 {
   DBUG_ENTER("fill_sql_text");
-  TABLE* table= tables->table;
-  Stats_iterator<SQL_TEXT *> iter(sql_stats_snapshot.text,
-                                   global_sql_stats.text, thd);
 
-  int result = 0;
-  if (mt_tables_access_control && check_global_access(thd, PROCESS_ACL))
-    result = -1;
+  int result = check_pre_fill_conditions(thd, "SQL_TEXT", THD::SQL_TEXT,
+                                         "global_sql_stats");
 
-  for (; !result && iter.is_valid(); iter.move_to_next())
+  if (!result)
   {
-    int f= 0;
-    SQL_TEXT *sql_text = iter.get_value();
+    TABLE* table= tables->table;
+    Stats_iterator<SQL_TEXT *> iter(sql_stats_snapshot.text,
+                                    global_sql_stats.text, thd);
 
-    restore_record(table, s->default_values);
+    for (; iter.is_valid(); iter.move_to_next())
+    {
+      int f= 0;
+      SQL_TEXT *sql_text = iter.get_value();
 
-    char sql_id_hex_string[MD5_BUFF_LENGTH];
-    array_to_hex(sql_id_hex_string, iter.get_key().data(),
-                 iter.get_key().size());
+      restore_record(table, s->default_values);
 
-    /* SQL ID */
-    table->field[f++]->store(sql_id_hex_string, MD5_BUFF_LENGTH,
-                             system_charset_info);
+      char sql_id_hex_string[MD5_BUFF_LENGTH];
+      array_to_hex(sql_id_hex_string, iter.get_key().data(),
+                   iter.get_key().size());
 
-    /* SQL Type */
-    std::string sql_type = sql_cmd_type(sql_text->sql_type);
-    table->field[f++]->store(sql_type.c_str(), sql_type.length(),
-                             system_charset_info);
-    /* SQL Text length */
+      /* SQL ID */
+      table->field[f++]->store(sql_id_hex_string, MD5_BUFF_LENGTH,
+                               system_charset_info);
 
-    String digest_text;
-    compute_digest_text(&sql_text->digest_storage, &digest_text);
-    table->field[f++]->store(sql_text->sql_text_length, TRUE);
-    /* SQL Text */
-    table->field[f++]->store(digest_text.c_ptr(),
-                             std::min(digest_text.length(), SQL_TEXT_COL_SIZE),
-                             system_charset_info);
+      /* SQL Type */
+      std::string sql_type = sql_cmd_type(sql_text->sql_type);
+      table->field[f++]->store(sql_type.c_str(), sql_type.length(),
+                               system_charset_info);
 
-    if (schema_table_store_record(thd, table))
-      result = -1;
+      /* SQL Text length */
+      table->field[f++]->store(sql_text->sql_text_length, TRUE);
+
+      /* SQL Text */
+      table->field[f++]->store(sql_text->sql_text,
+                               sql_text->sql_text_arr_len,
+                               system_charset_info);
+
+      if (schema_table_store_record(thd, table))
+        result = -1;
+    }
   }
 
   DBUG_RETURN(result);
@@ -2732,34 +2922,41 @@ int fill_sql_text(THD *thd, TABLE_LIST *tables, Item *cond)
 int fill_client_attrs(THD *thd, TABLE_LIST *tables, Item *cond)
 {
   DBUG_ENTER("fill_client_attrs");
-  int result = 0;
-  TABLE* table= tables->table;
-  Stats_iterator<std::string> iter(sql_stats_snapshot.client_attrs,
-                                   global_sql_stats.client_attrs, thd);
 
-  for (; iter.is_valid(); iter.move_to_next())
+  int result = check_pre_fill_conditions(thd, "CLIENT_ATTRIBUTES",
+                                         THD::CLIENT_ATTRS,
+                                         "global_sql_stats", false);
+
+  if (!result)
   {
-    int f= 0;
+    TABLE* table= tables->table;
+    Stats_iterator<std::string> iter(sql_stats_snapshot.client_attrs,
+                                     global_sql_stats.client_attrs, thd);
 
-    restore_record(table, s->default_values);
-
-    char client_id_hex_string[MD5_BUFF_LENGTH];
-    array_to_hex(client_id_hex_string, iter.get_key().data(),
-                 iter.get_key().size());
-
-    /* CLIENT_ID */
-    table->field[f++]->store(client_id_hex_string, MD5_BUFF_LENGTH,
-                             system_charset_info);
-
-    /* CLIENT_ATTRIBUTES */
-    table->field[f++]->store(iter.get_value().c_str(),
-                             std::min(4096, (int)iter.get_value().size()),
-                             system_charset_info);
-
-    if (schema_table_store_record(thd, table))
+    for (; iter.is_valid(); iter.move_to_next())
     {
-      result = -1;
-      break;
+      int f= 0;
+
+      restore_record(table, s->default_values);
+
+      char client_id_hex_string[MD5_BUFF_LENGTH];
+      array_to_hex(client_id_hex_string, iter.get_key().data(),
+                   iter.get_key().size());
+
+      /* CLIENT_ID */
+      table->field[f++]->store(client_id_hex_string, MD5_BUFF_LENGTH,
+                               system_charset_info);
+
+      /* CLIENT_ATTRIBUTES */
+      table->field[f++]->store(iter.get_value().c_str(),
+                               std::min(4096, (int)iter.get_value().size()),
+                               system_charset_info);
+
+      if (schema_table_store_record(thd, table))
+      {
+        result = -1;
+        break;
+      }
     }
   }
 
@@ -3059,4 +3256,15 @@ void Sql_stats_maps::move_maps(Sql_stats_maps &other)
   count = other.count;
 
   other.reset_maps();
+}
+
+/*
+  Stores the client attribute names
+*/
+void store_client_attribute_names(char *new_value) {
+  std::vector<std::string> new_attr_names = split_into_vector(new_value, ',');
+
+  bool lock_acquired = mt_lock(&LOCK_global_sql_stats);
+  client_attribute_names = new_attr_names;
+  mt_unlock(lock_acquired, &LOCK_global_sql_stats);
 }

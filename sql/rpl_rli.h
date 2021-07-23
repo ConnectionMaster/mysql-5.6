@@ -204,6 +204,8 @@ public:
   // next available id for new gtid info
   uint gtid_info_next_id;
 
+  std::pair<int64_t, int64_t> last_opid= std::make_pair(-1, -1);
+
   /* The following variables are safe to read any time */
 
   /*
@@ -834,13 +836,13 @@ public:
 
   int count_relay_log_space();
 
-  int rli_init_info();
+  int rli_init_info(bool startup= false);
   void end_info();
   int flush_info(bool force= FALSE);
   int flush_current_log();
   void set_master_info(Master_info *info);
 
-  inline ulonglong get_future_event_relay_log_pos() { return future_event_relay_log_pos; }
+  inline ulonglong get_future_event_relay_log_pos() const { return future_event_relay_log_pos; }
   inline void set_future_event_relay_log_pos(ulonglong log_pos)
   {
     future_event_relay_log_pos= log_pos;
@@ -857,8 +859,8 @@ public:
     group_master_log_pos= log_pos;
   }
 
-  inline const char* get_group_relay_log_name() { return group_relay_log_name; }
-  inline ulonglong get_group_relay_log_pos() { return group_relay_log_pos; }
+  inline const char* get_group_relay_log_name() const { return group_relay_log_name; }
+  inline ulonglong get_group_relay_log_pos() const { return group_relay_log_pos; }
   inline void set_group_relay_log_name(const char *log_file_name)
   {
      strmake(group_relay_log_name,log_file_name, sizeof(group_relay_log_name)-1);
@@ -872,8 +874,14 @@ public:
     group_relay_log_pos= log_pos;
   }
 
-  inline const char* get_event_relay_log_name() { return event_relay_log_name; }
-  inline ulonglong get_event_relay_log_pos() { return event_relay_log_pos; }
+  inline const char* get_event_relay_log_name() const
+  {
+    return event_relay_log_name;
+  }
+  inline ulonglong get_event_relay_log_pos() const
+  {
+    return event_relay_log_pos;
+  }
   inline void set_event_relay_log_name(const char *log_file_name)
   {
      strmake(event_relay_log_name,log_file_name, sizeof(event_relay_log_name)-1);
@@ -1010,6 +1018,13 @@ public:
   {
     commit_order_mngr= mngr;
   }
+
+  bool found_order_commit_deadlock() const
+  {
+    return m_order_commit_deadlock.load();
+  }
+  void report_order_commit_deadlock() { m_order_commit_deadlock= true; }
+  void reset_order_commit_deadlock() { m_order_commit_deadlock= false; }
 #endif
 
   virtual bool get_skip_unique_check()
@@ -1044,6 +1059,7 @@ private:
     corrdinator's order manager.
    */
   Commit_order_manager* commit_order_mngr;
+  std::atomic<bool> m_order_commit_deadlock{false};
 
   /**
     Delay slave SQL thread by this amount, compared to master (in
@@ -1155,6 +1171,9 @@ public:
   /* Set of all DBs accessed by the current group */
   std::unordered_set<std::string> dbs_accessed_by_group;
 
+  /* Set of tables that'll run in TBL mode */
+  std::unordered_set<std::string> tbl_mode_tables;
+
   // Mutex-condition pair to notify when queue is/is not full
   mysql_cond_t dep_full_cond;
   bool dep_full= false;
@@ -1179,6 +1198,19 @@ public:
   // Statistics
   std::atomic<ulonglong> begin_event_waits{0};
   std::atomic<ulonglong> next_event_waits{0};
+  std::atomic<ulonglong> num_syncs{0};
+
+#ifndef DBUG_OFF
+  std::mutex dep_fake_gap_lock;
+  Slave_worker* dep_fake_gap_lock_worker = nullptr;
+#endif
+
+  void set_dep_sync_group(bool val)
+  {
+    dep_sync_group= val;
+    if (dep_sync_group)
+      ++num_syncs;
+  }
 
   bool enqueue_dep(
       const std::shared_ptr<Log_event_wrapper> &begin_event)
@@ -1248,6 +1280,8 @@ public:
 
     trx_queued= false;
     num_events_in_current_group= 0;
+
+    tbl_mode_tables.clear();
 
     if (need_dep_lock)
       mysql_mutex_unlock(&dep_lock);

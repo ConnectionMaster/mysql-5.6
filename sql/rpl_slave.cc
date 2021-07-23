@@ -99,6 +99,15 @@ uint unique_check_lag_reset_threshold;
 const char *relay_log_index= 0;
 const char *relay_log_basename= 0;
 
+/* When raft has done a TermAdvancement, it starts
+ * the SQL thread. During the receive of No-Ops it
+ * does the log repointing and then starts the SQL
+ * thread. During this phase, no external actor should
+ * be able to start the SQL thread. This boolean is
+ * set to true when raft has stopped the SQL thread.
+ */
+std::atomic<bool> sql_thread_stopped_by_raft(false);
+
 /*
   MTS load-ballancing parameter.
   Max length of one MTS Worker queue. The value also determines the size
@@ -475,7 +484,8 @@ int init_slave()
     This is the startup routine and as such we try to
     configure both the SLAVE_SQL and SLAVE_IO.
   */
-  if (global_init_info(active_mi, true, thread_mask))
+  if (global_init_info(
+        active_mi, true, thread_mask, /*need_lock=*/true, /*startup=*/true))
   {
     sql_print_error("Failed to initialize the master info structure");
     error= 1;
@@ -1043,7 +1053,7 @@ err:
   DBUG_RETURN(recovery_error);
 }
 
-// TODO: currently we're only setting host port
+// TODO: sync this method with reset_slave()
 int raft_reset_slave(THD *thd)
 {
   DBUG_ENTER("raft_reset_slave");
@@ -1054,7 +1064,8 @@ int raft_reset_slave(THD *thd)
   active_mi->port = 0;
   active_mi->inited= false;
   active_mi->rli->inited= false;
-  active_mi->flush_info(true);
+
+  remove_info(active_mi);
 
   // no longer a slave. will be set again during change master
   is_slave = false;
@@ -1124,11 +1135,41 @@ int rli_relay_log_raft_reset(
   mysql_mutex_lock(&mi->data_lock);
   mysql_mutex_lock(&mi->rli->data_lock);
 
-  if (mi->rli->check_info() == REPOSITORY_DOES_NOT_EXIST) {
-    sql_print_information(
-        "Relay log info repository doesn't exists, creating one now");
-    if (global_init_info(mi, false, SLAVE_SQL | SLAVE_IO, false)) {
-      sql_print_error("Failed to initialize the master info structure");
+  enum_return_check check_return_mi= mi->check_info();
+  enum_return_check check_return_rli= mi->rli->check_info();
+
+  // If the master.info file does not exist, or if it exists,
+  // but the inited has never happened (most likely due to an
+  // error), try mi_init_info
+  if (check_return_mi == REPOSITORY_DOES_NOT_EXIST ||
+      !mi->inited)
+  {
+    // NO_LINT_DEBUG
+    sql_print_information("rli_relay_log_raft_reset: Master info "
+                          "repository doesn't exist or not inited."
+                          " Calling mi_init_info");
+    if (mi->mi_init_info())
+    {
+      // NO_LINT_DEBUG
+      sql_print_error("rli_relay_log_raft_reset: Failed to initialize "
+                      "the master info structure");
+      error= 1;
+      goto end;
+    }
+  }
+
+  if (check_return_rli == REPOSITORY_DOES_NOT_EXIST ||
+      !mi->rli->inited)
+  {
+    // NO_LINT_DEBUG
+    sql_print_information("rli_relay_log_raft_reset: Relay log info repository"
+                          " doesn't exist or not inited. Calling"
+                          " global_init_info");
+    if (global_init_info(mi, false, SLAVE_SQL | SLAVE_IO, false))
+    {
+      // NO_LINT_DEBUG
+      sql_print_error("rli_relay_log_raft_reset: Failed to initialize the"
+                      " relay log info structure");
       error= 1;
       goto end;
     }
@@ -1142,7 +1183,8 @@ int rli_relay_log_raft_reset(
   if (mi->rli->relay_log.open_index_file(opt_binlog_index_name,
                                         opt_bin_logname, false))
   {
-    sql_print_error("rli_relay_log_raft_reset::failed to open index file");
+    // NO_LINT_DEBUG
+    sql_print_error("rli_relay_log_raft_reset: Failed to open index file");
     error= 1;
     mi->rli->relay_log.unlock_index();
     mysql_mutex_unlock(mi->rli->relay_log.get_log_lock());
@@ -1168,7 +1210,8 @@ int rli_relay_log_raft_reset(
   if (mi->rli->relay_log.open_existing_binlog(opt_bin_logname,
                                     SEQ_READ_APPEND, max_binlog_size))
   {
-    sql_print_error("rli_relay_log_raft_reset::failed to open binlog file");
+    // NO_LINT_DEBUG
+    sql_print_error("rli_relay_log_raft_reset: Failed to open binlog file");
     error= 1;
     mi->rli->relay_log.unlock_index();
     mysql_mutex_unlock(mi->rli->relay_log.get_log_lock());
@@ -1186,14 +1229,15 @@ int rli_relay_log_raft_reset(
                                           &errmsg,
                                           0 /*look for a description_event*/)))
   {
-    sql_print_error(
-        "rli_relay_log_raft_reset::failed to init_relay_log_pos, errmsg: %s",
-        errmsg);
+    // NO_LINT_DEBUG
+    sql_print_error("rli_relay_log_raft_reset: Failed to "
+                    "init_relay_log_pos, errmsg: %s",
+                    errmsg);
     goto end;
   }
 
   sql_print_information(
-      "Relay log cursor set to: %s:%llu",
+      "rli_relay_log_raft_reset: Relay log cursor set to: %s:%llu",
       mi->rli->get_group_relay_log_name(),
       mi->rli->get_group_relay_log_pos());
 
@@ -1208,7 +1252,7 @@ end:
 }
 
 int global_init_info(Master_info* mi, bool ignore_if_no_info, int thread_mask,
-                     bool need_lock)
+                     bool need_lock, bool startup)
 {
   DBUG_ENTER("init_info");
   DBUG_ASSERT(mi != NULL && mi->rli != NULL);
@@ -1250,27 +1294,72 @@ int global_init_info(Master_info* mi, bool ignore_if_no_info, int thread_mask,
   check_return= mi->check_info();
   if (check_return == ERROR_CHECKING_REPOSITORY)
   {
+    if (enable_raft_plugin)
+    {
+      // NO_LINT_DEBUG
+      sql_print_error("global_init_info: mi repository "
+                      "check returns ERROR_CHECKING_REPOSITORY");
+    }
     init_error= 1;
     goto end;
   }
 
+  // ignore_if_no_info is used to skip the init_info process if
+  // master.info file is not present. Its used to skip this
+  // code in the startup of mysqld.
+  // Set ignore_if_no_info to always call mi_init_info
   if (!(ignore_if_no_info && check_return == REPOSITORY_DOES_NOT_EXIST))
   {
-    if ((thread_mask & SLAVE_IO) != 0 && mi->mi_init_info())
-      init_error= 1;
+    if ((thread_mask & SLAVE_IO) != 0)
+    {
+      if (enable_raft_plugin)
+      {
+        // NO_LINT_DEBUG
+        sql_print_information("global_init_info: mi_init_info called");
+      }
+      if (mi->mi_init_info())
+      {
+        if (enable_raft_plugin)
+        {
+          // NO_LINT_DEBUG
+          sql_print_error("global_init_info: mi_init_info returned error");
+        }
+        init_error= 1;
+      }
+    }
   }
 
   check_return= mi->rli->check_info();
   if (check_return == ERROR_CHECKING_REPOSITORY)
   {
+    if (enable_raft_plugin)
+    {
+      // NO_LINT_DEBUG
+      sql_print_error("global_init_info: rli repository check returns"
+                      " ERROR_CHECKING_REPOSITORY");
+    }
     init_error= 1;
     goto end;
   }
   if (!(ignore_if_no_info && check_return == REPOSITORY_DOES_NOT_EXIST))
   {
-    if (((thread_mask & SLAVE_SQL) != 0 || !(mi->rli->inited))
-        && mi->rli->rli_init_info())
-      init_error= 1;
+    if (((thread_mask & SLAVE_SQL) != 0 || !(mi->rli->inited)))
+    {
+      if (enable_raft_plugin)
+      {
+        // NO_LINT_DEBUG
+        sql_print_information("global_init_info: rli_init_info called");
+      }
+      if (mi->rli->rli_init_info(startup))
+      {
+        if (enable_raft_plugin)
+        {
+          // NO_LINT_DEBUG
+          sql_print_error("global_init_info: rli_init_info returned error");
+        }
+        init_error= 1;
+      }
+    }
   }
 
   DBUG_EXECUTE_IF("enable_mts_worker_failure_init",
@@ -1914,6 +2003,12 @@ int start_slave_threads(bool need_lock_slave, bool wait_for_start,
   {
     error= !mi->inited ? ER_SLAVE_MI_INIT_REPOSITORY :
                          ER_SLAVE_RLI_INIT_REPOSITORY;
+    if (enable_raft_plugin)
+    {
+      // NO_LINT_DEBUG
+      sql_print_error("start_slave_threads: error: %d mi_inited: %d",
+                      error, mi->inited);
+    }
     Rpl_info *info= (!mi->inited ?  mi : static_cast<Rpl_info *>(mi->rli));
     const char* prefix= current_thd ? ER(error) : ER_DEFAULT(error);
     info->report(ERROR_LEVEL, error, prefix, NULL);
@@ -4913,6 +5008,30 @@ static int exec_relay_log_event(THD* thd, Relay_log_info* rli)
 
   Log_event *ev = next_event(rli), **ptr_ev;
 
+  if (enable_raft_plugin && ev && ev->get_type_code() == METADATA_EVENT) {
+    Metadata_log_event *mev = static_cast<Metadata_log_event *>(ev);
+    if (mev->does_exist(Metadata_log_event::Metadata_log_event_types::
+                            RAFT_TERM_INDEX_TYPE)) {
+      const int64_t term = mev->get_raft_term();
+      const int64_t index = mev->get_raft_index();
+      if (rli->last_opid.first != -1 && rli->last_opid.second != -1 &&
+          (index != rli->last_opid.second + 1 || term < rli->last_opid.first)) {
+        char msg[1024];
+        snprintf(
+            msg, sizeof(msg),
+            "Out of order opid found last opid=%ld:%ld, current opid=%ld:%ld",
+            rli->last_opid.first, rli->last_opid.second, term, index);
+        rli->report(ERROR_LEVEL, ER_SLAVE_RELAY_LOG_READ_FAILURE,
+                    ER(ER_SLAVE_RELAY_LOG_READ_FAILURE), msg);
+        rli->abort_slave = 1;
+        mysql_mutex_unlock(&rli->data_lock);
+        delete ev;
+        DBUG_RETURN(1);
+      }
+      rli->last_opid = std::make_pair(term, index);
+    }
+  }
+
   DBUG_ASSERT(rli->info_thd==thd);
 
   if (sql_slave_killed(thd,rli))
@@ -5984,6 +6103,12 @@ pthread_handler_t handle_slave_worker(void *arg)
 
   mysql_mutex_unlock(&w->jobs_lock);
 
+  // Additional cleanup since the worker object is yet to
+  // destroyed
+  mysql_mutex_lock(&w->info_thd_lock);
+  w->info_thd= NULL;
+  mysql_mutex_unlock(&w->info_thd_lock);
+
 err:
 
   if (thd)
@@ -6924,6 +7049,8 @@ pthread_handler_t handle_slave_sql(void *arg)
   mysql_mutex_lock(&rli->info_thd_lock);
   rli->info_thd= thd;
   mysql_mutex_unlock(&rli->info_thd_lock);
+
+  rli->last_opid= std::make_pair(-1, -1);
 
   rli->mts_dependency_replication= opt_mts_dependency_replication;
   rli->mts_dependency_size= opt_mts_dependency_size;
@@ -8295,7 +8422,7 @@ static int queue_event(Master_info* mi,const char* buf, ulong event_len)
       DBUG_ASSERT(rli->ign_master_log_name_end[0]);
       rli->ign_master_log_pos_end= mi->get_master_log_pos();
     }
-    rli->relay_log.signal_update(); // the slave SQL thread needs to re-check
+    rli->relay_log.update_binlog_end_pos(); // the slave SQL thread needs to re-check
     mysql_mutex_unlock(log_lock);
     DBUG_PRINT("info", ("master_log_pos: %lu, event originating from %u server, ignored",
                         (ulong) mi->get_master_log_pos(), uint4korr(buf + SERVER_ID_OFFSET)));
@@ -9501,7 +9628,7 @@ uint sql_slave_skip_counter;
   @retval 0 success
   @retval 1 error
 */
-int start_slave(THD* thd , Master_info* mi,  bool net_report)
+int start_slave(THD* thd , Master_info* mi,  bool net_report, bool invoked_by_raft)
 {
   int slave_errno= 0;
   int thread_mask;
@@ -9546,8 +9673,30 @@ int start_slave(THD* thd , Master_info* mi,  bool net_report)
 
   if (thread_mask) //some threads are stopped, start them
   {
+    // If raft is doing some critical operations to block out threads,
+    // we disallow slave sql start till raft has restarted the slave
+    // thread.
+    if (enable_raft_plugin && !invoked_by_raft && sql_thread_stopped_by_raft)
+    {
+      unlock_slave_threads(mi);
+
+      // NO_LINT_DEBUG
+      sql_print_information(
+          "Did not allow start_slave as raft has stopped SQL threads");
+      my_error(ER_RAFT_OPERATION_INCOMPATIBLE, MYF(0),
+          "start slave not allowed when raft has stopped SQL threads");
+      DBUG_RETURN(1);
+    }
+
     if (global_init_info(mi, false, thread_mask))
+    {
       slave_errno=ER_MASTER_INFO;
+      if (enable_raft_plugin)
+      {
+        // NO_LINT_DEBUG
+        sql_print_error("start_slave: error as global_init_info failed");
+      }
+    }
     else if (server_id_supplied && *mi->host)
     {
       /*
@@ -9764,6 +9913,12 @@ int raft_stop_sql_thread(THD *thd)
   }
 
   res= stop_slave(thd, active_mi, false);
+  if (!res)
+  {
+    // set this flag to prevent other non-raft actors from
+    // starting sql thread during critical raft operations
+    sql_thread_stopped_by_raft= true;
+  }
 
 end:
   mysql_mutex_unlock(&LOCK_active_mi);
@@ -9780,7 +9935,13 @@ int raft_start_sql_thread(THD *thd)
     goto end;
   }
 
-  res= start_slave(thd, active_mi, false);
+  res= start_slave(thd, active_mi, false, true);
+  if (!res)
+  {
+    // reset this flag to let other non-raft actors
+    // to stop and start sql threads.
+    sql_thread_stopped_by_raft= false;
+  }
 
 end:
   mysql_mutex_unlock(&LOCK_active_mi);
@@ -9967,6 +10128,15 @@ bool change_master(THD* thd, Master_info* mi)
   bool mts_remove_workers= false;
 
   DBUG_ENTER("change_master");
+  if (enable_raft_plugin && !override_enable_raft_check)
+  {
+    // NO_LINT_DEBUG
+    sql_print_information(
+        "Did not allow change_master as enable_raft_plugin is ON");
+    my_error(ER_RAFT_OPERATION_INCOMPATIBLE, MYF(0),
+        "change master not allowed when enable_raft_plugin is ON");
+    DBUG_RETURN(1);
+  }
 
   lock_slave_threads(mi);
   init_thread_mask(&thread_mask,mi,0 /*not inverse*/);
@@ -10390,18 +10560,17 @@ err:
 
 /* counter for the number of BI inconsistencies found */
 ulong before_image_inconsistencies= 0;
-/* table_name -> last gtid for BI inconsistencies */
-std::unordered_map<std::string, std::string> bi_inconsistencies;
+/* table_name -> last BI inconsistency info */
+std::unordered_map<std::string, before_image_mismatch>
+  bi_inconsistencies;
 /* mutex for counter and map */
 std::mutex bi_inconsistency_lock;
 
-void update_before_image_inconsistencies(
-    const char* db, const char* table, const char* gtid)
+void update_before_image_inconsistencies(const before_image_mismatch &mismatch)
 {
   const std::lock_guard<std::mutex> lock(bi_inconsistency_lock);
   ++before_image_inconsistencies;
-  std::string fqtn= std::string(db) + "." + std::string(table);
-  bi_inconsistencies[fqtn]= gtid;
+  bi_inconsistencies[mismatch.table]= mismatch;
 }
 
 ulong get_num_before_image_inconsistencies()
@@ -10409,7 +10578,6 @@ ulong get_num_before_image_inconsistencies()
   const std::lock_guard<std::mutex> lock(bi_inconsistency_lock);
   return before_image_inconsistencies;
 }
-
 
 /**
   @} (end of group Replication)

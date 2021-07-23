@@ -47,7 +47,8 @@ typedef enum _thd_wait_type_e {
   THD_WAIT_NET_IO= 11,
   THD_WAIT_YIELD= 12,
   THD_WAIT_FOR_HLC= 13,
-  THD_WAIT_LAST= 14
+  THD_WAIT_COMMIT= 14,
+  THD_WAIT_LAST= 15
 } thd_wait_type;
 extern struct thd_wait_service_st {
   void (*thd_wait_begin_func)(void*, int);
@@ -131,9 +132,11 @@ struct st_mysql_show_var {
   char *value;
   enum enum_mysql_show_type type;
 };
+typedef struct st_mysql_show_var SHOW_VAR;
 typedef int (*mysql_show_var_func)(void*, struct st_mysql_show_var*, char *);
 struct st_mysql_sys_var;
 struct st_mysql_value;
+typedef struct st_mysql_sys_var SYS_VAR;
 typedef int (*mysql_var_check_func)(void* thd,
                                     struct st_mysql_sys_var *var,
                                     void *save, struct st_mysql_value *value);

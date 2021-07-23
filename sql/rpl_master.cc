@@ -131,6 +131,7 @@ static comp_event_queue comp_event_queue_list[COMP_EVENT_CACHE_NUM_SHARDS];
 static std::atomic<size_t>
         comp_event_cache_size_list[COMP_EVENT_CACHE_NUM_SHARDS];
 
+std::atomic<bool> block_dump_threads{false};
 
 #ifndef DBUG_OFF
 static int binlog_dump_count = 0;
@@ -307,12 +308,12 @@ int store_replica_stats(THD *thd, uchar *packet, uint packet_length)
 
   if (si != nullptr)
   {
-    if (si->slave_stats == nullptr) 
+    if (si->slave_stats == nullptr)
     {
       si->slave_stats = new std::list<SLAVE_STATS>();
     }
-    // We are over the configured size. Erase older entries first. 
-    while (!si->slave_stats->empty() && si->slave_stats->size() >= write_stats_count) 
+    // We are over the configured size. Erase older entries first.
+    while (!si->slave_stats->empty() && si->slave_stats->size() >= write_stats_count)
     {
       si->slave_stats->pop_back();
     }
@@ -324,10 +325,10 @@ int store_replica_stats(THD *thd, uchar *packet, uint packet_length)
 }
 
 /**
-  Scans through the replication lag reported by individual secondaries and 
-  returns replication lag for the entire topology. Replication lag for the 
-  topology is defined as kth largest replication lag reported by individual 
-  secondaries where k = write_throttle_lag_min_secondaries. 
+  Scans through the replication lag reported by individual secondaries and
+  returns replication lag for the entire topology. Replication lag for the
+  topology is defined as kth largest replication lag reported by individual
+  secondaries where k = write_throttle_lag_min_secondaries.
   This method is used for auto throttling write workload to avoid replication lag
 
   @retval replication_lag
@@ -335,7 +336,7 @@ int store_replica_stats(THD *thd, uchar *packet, uint packet_length)
 int get_current_replication_lag() {
   if (write_throttle_lag_pct_min_secondaries == 0)
     return 0;
-  
+
   // find the lag
   std::vector<int> replica_lags;
   mysql_mutex_lock(&LOCK_slave_list);
@@ -358,7 +359,7 @@ int get_current_replication_lag() {
 
   int min_secondaries_to_lag = ceil(replica_lags.size() * (double)write_throttle_lag_pct_min_secondaries / 100);
   if (min_secondaries_to_lag == 0) {
-    // not enough secondaries(registered so far) in replication topology to qualify for lag 
+    // not enough secondaries(registered so far) in replication topology to qualify for lag
     return 0;
   }
 
@@ -384,12 +385,12 @@ int fill_replica_statistics(THD *thd, TABLE_LIST *tables, Item *cond)
   for (uint slaveIter = 0; slaveIter < slave_list.records; ++slaveIter)
   {
     SLAVE_INFO* si = (SLAVE_INFO*) my_hash_element(&slave_list, slaveIter);
-    if (si->slave_stats == nullptr) 
+    if (si->slave_stats == nullptr)
     {
       // No stats collected for this slave so far, continue
       continue;
     }
-    for (const SLAVE_STATS &stats : *(si->slave_stats)) 
+    for (const SLAVE_STATS &stats : *(si->slave_stats))
     {
       int fieldPos= 0;
       MYSQL_TIME time;
@@ -397,10 +398,10 @@ int fill_replica_statistics(THD *thd, TABLE_LIST *tables, Item *cond)
       // slave id
       table->field[fieldPos++]->store(si->server_id, TRUE);
       // timestamp
-      if (stats.timestamp == 0) 
+      if (stats.timestamp == 0)
       {
         table->field[fieldPos++]->set_null();
-      } else 
+      } else
       {
         thd->variables.time_zone->gmt_sec_to_TIME(
             &time, (my_time_t)stats.timestamp);
@@ -455,9 +456,9 @@ int register_slave(THD* thd, uchar* packet, uint packet_length)
     goto err;
   si->port= uint2korr(p);
   p += 2;
-  /* 
+  /*
      We need to by pass the bytes used in the fake rpl_recovery_rank
-     variable. It was removed in patch for BUG#13963. But this would 
+     variable. It was removed in patch for BUG#13963. But this would
      make a server with that patch unable to connect to an old master.
      See: BUG#49259
   */
@@ -616,7 +617,7 @@ inline void fix_checksum(String *packet, ulong ev_offset)
   /* recalculate the crc for this event */
   uint data_len = uint4korr(packet->ptr() + ev_offset + EVENT_LEN_OFFSET);
   ha_checksum crc= my_checksum(0L, NULL, 0);
-  DBUG_ASSERT(data_len == 
+  DBUG_ASSERT(data_len ==
               LOG_EVENT_MINIMAL_HEADER_LEN + FORMAT_DESCRIPTION_HEADER_LEN +
               BINLOG_CHECKSUM_ALG_DESC_LEN + BINLOG_CHECKSUM_LEN);
   crc= my_checksum(crc, (uchar *)packet->ptr() + ev_offset, data_len -
@@ -628,7 +629,7 @@ inline void fix_checksum(String *packet, ulong ev_offset)
 static user_var_entry * get_binlog_checksum_uservar(THD * thd)
 {
   LEX_STRING name=  { C_STRING_WITH_LEN("master_binlog_checksum")};
-  user_var_entry *entry= 
+  user_var_entry *entry=
     (user_var_entry*) my_hash_search(&thd->user_vars, (uchar*) name.str,
                                   name.length);
   return entry;
@@ -1075,7 +1076,7 @@ static int fake_rotate_event(NET* net, String* packet, char* log_file_name,
 
   /*
     this Rotate is to be sent with checksum if and only if
-    slave's get_master_version_and_clock time handshake value 
+    slave's get_master_version_and_clock time handshake value
     of master's @@global.binlog_checksum was TRUE
   */
 
@@ -1280,12 +1281,12 @@ Increase max_allowed_packet on master";
 
   @return        heartbeat period an ulonglong of nanoseconds
                  or zero if heartbeat was not demanded by slave
-*/ 
+*/
 static ulonglong get_heartbeat_period(THD * thd)
 {
   my_bool null_value;
   LEX_STRING name=  { C_STRING_WITH_LEN("master_heartbeat_period")};
-  user_var_entry *entry= 
+  user_var_entry *entry=
     (user_var_entry*) my_hash_search(&thd->user_vars, (uchar*) name.str,
                                   name.length);
   return entry? entry->val_int(&null_value) : 0;
@@ -1878,7 +1879,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
                         __LINE__));                                     \
     goto err;                                                           \
   } while (0)
-  LOG_INFO linfo;
+  LOG_INFO linfo(dump_log.is_relay_log(), /* is_used_by_dump_thd = */ true);
   char *log_file_name = linfo.log_file_name;
   char search_file_name[FN_REFLEN], *name;
 
@@ -1974,7 +1975,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
   DBUG_PRINT("enter",("log_ident: '%s'  pos: %ld", log_ident, (long) pos));
 
   memset(&log, 0, sizeof(log));
-  /* 
+  /*
      heartbeat_period from @master_heartbeat_period user variable
   */
   ulonglong heartbeat_period= get_heartbeat_period(thd);
@@ -2007,6 +2008,12 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
 
   ulonglong dump_thread_wait_sleep_usec= get_dump_thread_wait_sleep(thd);
 
+  if (block_dump_threads)
+  {
+    sql_print_error("Binlog dump threads are blocked!");
+    GOTO_ERR;
+  }
+
 #ifndef DBUG_OFF
   if (opt_sporadic_binlog_dump_fail && (binlog_dump_count++ % 2))
   {
@@ -2016,7 +2023,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
   }
 #endif
 
-  if (!mysql_bin_log.is_open())
+  if (!dump_log.is_open())
   {
     errmsg = "Binary log is not open";
     my_errno= ER_MASTER_FATAL_ERROR_READING_BINLOG;
@@ -2046,7 +2053,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
 
   name= search_file_name;
   if (log_ident[0])
-    mysql_bin_log.make_log_name(search_file_name, log_ident);
+    dump_log.make_log_name(search_file_name, log_ident);
   else
   {
     if (using_gtid_protocol)
@@ -2105,19 +2112,42 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
         will not find one and an error ER_MASTER_HAS_PURGED_REQUIRED_GTIDS
         is thrown from there.
       */
-      if (!gtid_state->get_lost_gtids()->is_subset(slave_gtid_executed))
+      bool lost_gtids_is_subset= false;
+      if (!enable_raft_plugin)
+      {
+        const Gtid_set *lost_gtids= gtid_state->get_lost_gtids();
+        lost_gtids_is_subset= lost_gtids->is_subset(slave_gtid_executed);
+        global_sid_lock->unlock();
+      }
+      else
+      {
+        global_sid_lock->unlock();
+        /** In raft mode we calculate lost gtids from the binlog/relaylog index
+         * file instead of using the global state that is always based on the
+         * apply side binlogs. Apply logs are purged on election so global state
+         * is currently incorrect wrt raft logs.
+         *
+         * TODO: Remove this hack after global gtid state is fixed wrt to raft
+         * logs
+         */
+        Sid_map gtids_lost_sid_map(nullptr);
+        Gtid_set gtids_lost(&gtids_lost_sid_map);
+        dump_log.get_lost_gtids(&gtids_lost);
+        lost_gtids_is_subset= gtids_lost.is_subset(slave_gtid_executed);
+      }
+
+      if (!lost_gtids_is_subset)
       {
         errmsg= ER(ER_MASTER_HAS_PURGED_REQUIRED_GTIDS);
         my_errno= ER_MASTER_FATAL_ERROR_READING_BINLOG;
-        global_sid_lock->unlock();
         GOTO_ERR;
       }
-      global_sid_lock->unlock();
+
       first_gtid.clear();
-      if (mysql_bin_log.find_first_log_not_in_gtid_set(name,
-                                                       slave_gtid_executed,
-                                                       &first_gtid,
-                                                       &errmsg))
+      if (dump_log.find_first_log_not_in_gtid_set(name,
+                                                  slave_gtid_executed,
+                                                  &first_gtid,
+                                                  &errmsg))
       {
          my_errno= ER_MASTER_FATAL_ERROR_READING_BINLOG;
          GOTO_ERR;
@@ -2129,7 +2159,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
 
   linfo.index_file_offset= 0;
 
-  if (mysql_bin_log.find_log_pos(&linfo, name, 1))
+  if (dump_log.find_log_pos(&linfo, name, 1))
   {
     errmsg = "Could not find first log file name in binary log index file";
     my_errno= ER_MASTER_FATAL_ERROR_READING_BINLOG;
@@ -2233,13 +2263,12 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
 
   /*
     Adding MAX_LOG_EVENT_HEADER_LEN, since a binlog event can become
-    this larger than the corresponding packet (query) sent 
+    this larger than the corresponding packet (query) sent
     from client to master.
   */
   thd->variables.max_allowed_packet= MAX_MAX_ALLOWED_PACKET;
 
   p_coord->pos= pos; // the first hb matches the slave's last seen value
-  log_cond= mysql_bin_log.get_log_cond();
   if (pos > BIN_LOG_HEADER_SIZE)
   {
     /* reset transmit packet for the event read from binary log
@@ -2256,7 +2285,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
      */
     if (!(error = Log_event::read_log_event(&log, packet, 0,
                                             log_file_name)))
-    { 
+    {
       DBUG_PRINT("info", ("read_log_event returned 0 on line %d", __LINE__));
       /*
         The packet has offsets equal to the normal offsets in a
@@ -2774,7 +2803,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
                                   packet, packet_buffer, packet_buffer_size,
                                   semi_sync_slave))
           GOTO_ERR;
-        
+
 	/*
 	  No one will update the log while we are reading
 	  now, but we'll be quick and just read one record
@@ -2827,7 +2856,20 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
             usleep(dump_thread_wait_sleep_usec);
           }
 
-          mysql_bin_log.lock_binlog_end_pos();
+          // Note: This part is tricky and should be touched if you really know
+          // what you're doing. We're locking dump log to get the raw log
+          // pointer, then we're locking end log pos before unlocking the dump
+          // log. We're taking the lock in the same sequence as when log is
+          // switched in binlog_change_to_binlog() and binlog_change_to_apply()
+          // to avoid deadlocks. This locking pattern ensures that we're working
+          // with the correct raw log and that there is no race between getting
+          // the raw log and log switching. Log switching will be blocked until
+          // we release the binlog end pos lock before waiting for signal in
+          // wait_for_update_bin_log().
+          const bool is_dump_log_locked= dump_log.lock();
+          MYSQL_BIN_LOG* raw_log= dump_log.get_log(false);
+          raw_log->lock_binlog_end_pos();
+          dump_log.unlock(is_dump_log_locked);
 
           /*
             No need to wait if the the current log is not active or
@@ -2839,10 +2881,10 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
             unblock us and checking is_active() later in read_log_event() will
             give the valid value.
           */
-          if (!mysql_bin_log.is_active(log_file_name) ||
-              my_b_tell(&log) < mysql_bin_log.get_binlog_end_pos())
+          if (!raw_log->is_active(log_file_name) ||
+              my_b_tell(&log) < raw_log->get_binlog_end_pos())
           {
-            mysql_bin_log.unlock_binlog_end_pos();
+            raw_log->unlock_binlog_end_pos();
             break;
           }
 
@@ -2882,7 +2924,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
           if (thd->server_id == 0 || ((flags & BINLOG_DUMP_NON_BLOCK) != 0))
 	  {
             DBUG_PRINT("info", ("stopping dump thread because server_id==0 or the BINLOG_DUMP_NON_BLOCK flag is set: server_id=%u flags=%d", thd->server_id, flags));
-            mysql_bin_log.unlock_binlog_end_pos();
+            raw_log->unlock_binlog_end_pos();
 	    goto end;
 	  }
 
@@ -2894,16 +2936,17 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
           ulong hb_info_counter= 0;
 #endif
           PSI_stage_info old_stage;
-          signal_cnt= mysql_bin_log.signal_cnt;
+          signal_cnt= raw_log->signal_cnt;
 
-          do 
+          do
           {
             if (heartbeat_period != 0)
             {
               DBUG_ASSERT(heartbeat_ts);
               set_timespec_nsec(*heartbeat_ts, heartbeat_period);
             }
-            thd->ENTER_COND(log_cond, mysql_bin_log.get_binlog_end_pos_lock(),
+            log_cond= raw_log->get_log_cond();
+            thd->ENTER_COND(log_cond, raw_log->get_binlog_end_pos_lock(),
                             &stage_master_has_sent_all_binlog_to_slave,
                             &old_stage);
             /*
@@ -2940,7 +2983,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
               last_skip_group= false; /*A HB for this pos has been sent. */
             }
 
-            ret= mysql_bin_log.wait_for_update_bin_log(thd, heartbeat_ts);
+            ret= raw_log->wait_for_update_bin_log(thd, heartbeat_ts);
             DBUG_ASSERT(ret == 0 || (heartbeat_period != 0));
             if (ret == ETIMEDOUT || ret == ETIME)
             {
@@ -2987,11 +3030,11 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
             {
               DBUG_PRINT("wait",("binary log received update or a broadcast signal caught"));
             }
-          } while (signal_cnt == mysql_bin_log.signal_cnt && !thd->killed);
+          } while (signal_cnt == raw_log->signal_cnt && !thd->killed);
           thd->EXIT_COND(&old_stage);
         }
         break;
-            
+
         default:
           test_for_non_eof_log_read_errors(error, &errmsg);
           GOTO_ERR;
@@ -3173,7 +3216,15 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
       binlog_has_previous_gtids_log_event= false;
 
       THD_STAGE_INFO(thd, stage_finished_reading_one_binlog_switching_to_next_binlog);
-      switch (mysql_bin_log.find_next_log(&linfo, 1)) {
+
+      DBUG_EXECUTE_IF("dump_wait_before_find_next_log",
+      {
+         const char act[]= "now signal signal.reached wait_for signal.done";
+         DBUG_ASSERT(opt_debug_sync_timeout > 0);
+         DBUG_ASSERT(!debug_sync_set_action(thd, STRING_WITH_LEN(act)));
+      };);
+
+      switch (dump_log.find_next_log(&linfo, 1)) {
       case 0:
         break;
       default:
@@ -3191,7 +3242,7 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
                                 packet, packet_buffer, packet_buffer_size,
                                 semi_sync_slave))
         GOTO_ERR;
-      
+
       /*
         Call fake_rotate_event() in case the previous log (the one which
         we have just finished reading) did not contain a Rotate event.
@@ -3271,7 +3322,7 @@ err:
   THD_STAGE_INFO(thd, stage_waiting_to_finalize_termination);
   if (my_errno == ER_MASTER_FATAL_ERROR_READING_BINLOG && my_b_inited(&log))
   {
-    /* 
+    /*
        detailing the fatal error message with coordinates
        of the last position read.
     */
@@ -3692,14 +3743,14 @@ bool show_binlogs(THD* thd, bool with_gtid)
   if (protocol->send_result_set_metadata(&field_list,
                             Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
     DBUG_RETURN(TRUE);
-  
+
   mysql_mutex_lock(mysql_bin_log.get_binlog_end_pos_lock());
   DEBUG_SYNC(thd, "show_binlogs_after_lock_log_before_lock_index");
   mysql_bin_log.get_current_log_without_lock_log(&cur);
   mysql_mutex_unlock(mysql_bin_log.get_binlog_end_pos_lock());
   mysql_bin_log.lock_index();
   index_file=mysql_bin_log.get_index_file();
-  
+
   cur_dir_len= dirname_length(cur.log_file_name);
 
   reinit_io_cache(index_file, READ_CACHE, (my_off_t) 0, 0, 0);

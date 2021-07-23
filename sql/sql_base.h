@@ -396,6 +396,9 @@ int fill_sql_text(THD *thd, TABLE_LIST *tables, Item *cond);
 extern ST_FIELD_INFO client_attrs_fields_info[];
 int fill_client_attrs(THD *thd, TABLE_LIST *tables, Item *cond);
 
+/* Stores the client attribute names */
+void store_client_attribute_names(char *new_value);
+
 /* For information_schema.sql_plans */
 extern ST_FIELD_INFO sql_plan_fields_info[];
 extern mysql_mutex_t LOCK_global_sql_plans;
@@ -422,8 +425,10 @@ extern ST_FIELD_INFO write_throttling_rules_fields_info[];
 extern mysql_mutex_t LOCK_global_write_throttling_rules;
 int  fill_write_throttling_rules(THD *thd, TABLE_LIST *tables, Item *cond);
 void free_global_write_throttling_rules(void);
+void free_global_write_auto_throttling_rules(void);
 bool store_write_throttling_rules(THD *thd);
-void check_lag_and_throttle();
+void check_lag_and_throttle(time_t time_now);
+bool store_write_throttle_permissible_dimensions_in_order(char *new_value);
 
 /* For information_schema.write_throttling_log */
 extern ST_FIELD_INFO write_throttling_log_fields_info[];
